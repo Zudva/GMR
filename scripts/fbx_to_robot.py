@@ -619,6 +619,12 @@ def parse_args(argv=None):
     p.add_argument("--force_generic_loader", action="store_true", help="Skip lafan1 loader and use generic BVH parser always")
     p.add_argument("--orient_fix", type=str, default="none", choices=["none","x90","x-90","y90","y-90","z180","auto"], help="Orientation fix: preset rotation or auto (detect up/forward)")
     p.add_argument("--auto_forward_axis", type=str, default="x", choices=["x","y"], help="Desired forward axis for --orient_fix auto (default x)")
+    p.add_argument("--ubisoft_axes", action="store_true", help="Force lafan1(Ubisoft) axis convention only (Y-up->Z-up) and skip extra orient composition")
+    p.add_argument("--normalize_root", action="store_true", help="Shift initial Hips to origin and set floor (min foot z) to 0")
+    p.add_argument("--always_overwrite", action="store_true", help="Always re-convert FBX -> BVH even if output exists")
+    p.add_argument("--log_errors", action="store_true", help="Print per-frame IK task errors and positional discrepancies")
+    p.add_argument("--errors_csv", type=str, default=None, help="Path to CSV file to append per-frame errors")
+    p.add_argument("--dump_bvh_header", type=int, default=0, help="Print first N lines of BVH file then continue")
     return p.parse_args(argv)
 
 def main(argv=None):
@@ -632,12 +638,13 @@ def main(argv=None):
             out_bvh = pathlib.Path(args.out_bvh).expanduser().resolve()
         else:
             out_bvh = fbx_path.with_suffix(".converted.bvh")
-        if args.use_blender or not out_bvh.exists() or args.inspect_fbx:
+        force_conv = args.use_blender or args.always_overwrite or not out_bvh.exists() or args.inspect_fbx
+        if force_conv:
             convert_fbx_to_bvh_with_blender(
                 blender_exec=args.blender_path,
                 fbx_path=fbx_path,
                 out_bvh=out_bvh,
-                force=args.overwrite,
+                force=True if args.always_overwrite else args.overwrite,
                 inspect_only=args.inspect_fbx,
                 debug=args.blender_debug,
                 armature_name=args.armature_name,
@@ -654,6 +661,17 @@ def main(argv=None):
             print(f"[red]BVH file not found: {bvh_file}[/red]")
             sys.exit(1)
     print(f"[green]Using BVH file: {bvh_file}[/green]")
+    # Optional BVH header dump
+    if args.dump_bvh_header > 0:
+        try:
+            with open(bvh_file, 'r', encoding='utf-8', errors='ignore') as fh:
+                for i in range(args.dump_bvh_header):
+                    line = fh.readline()
+                    if not line:
+                        break
+                    print(f"[magenta]BVH[{i:03d}]:[/magenta] {line.rstrip()}")
+        except Exception as e:
+            print(f"[red]Failed to dump BVH header: {e}[/red]")
     # Compute orientation correction quaternion
     orient_map = {
         'none': np.array([1,0,0,0]),
@@ -680,6 +698,29 @@ def main(argv=None):
         frames = _fill_synonyms(frames)
     else:
         frames, human_height = load_frames_from_bvh(bvh_file, allow_missing=args.allow_missing_joints, axis_fix=not args.no_axis_fix)
+
+    # Ubisoft axis mode: override any orient fix (keeps pure lafan1 transform)
+    if args.ubisoft_axes:
+        ORIENT_FIX_QUAT = np.array([1,0,0,0])
+        if args.orient_fix not in ('none','auto'):
+            print("[yellow]--ubisoft_axes overrides --orient_fix preset; ignoring preset rotation[/yellow]")
+        # No post rotation adjustment applied (frames already rotated by axis fix earlier)
+
+    # Root normalization (after auto/orient fix so it applies to final positions)
+    if args.normalize_root:
+        if "Hips" in frames[0]:
+            root0 = frames[0]["Hips"][0].copy()
+            # Estimate floor from feet if available
+            feet_z = []
+            for k in ["LeftToeBase","RightToeBase","LeftFoot","RightFoot","LeftFootMod","RightFootMod"]:
+                if k in frames[0]:
+                    feet_z.append(frames[0][k][0][2])
+            floor_z = min(feet_z) if feet_z else root0[2]
+            dz = root0.copy(); dz[2] = floor_z  # translation to move hips.x/y to origin, feet to 0
+            for fr in frames:
+                for name,(p,q) in fr.items():
+                    fr[name] = (p - dz, q)
+            print(f"[cyan]Normalized root: shifted by {dz} (floor_z={floor_z:.3f})[/cyan]")
 
     # Auto orientation (post-load rotation of frames)
     if args.orient_fix == 'auto':
@@ -762,18 +803,82 @@ def main(argv=None):
             if np.max(bbox) < 1e-3:
                 print("[red]Detected almost zero root motion. Likely export did not bake animation. Re-run with --use_blender --overwrite after ensuring actions exist, or verify FBX has keyframes.[/red]")
     print(f"Loaded {len(frames)} frames (assumed FPS=30), human_height={human_height:.2f}m")
+    # Prepare error CSV if requested
+    csv_writer = None
+    if args.errors_csv:
+        try:
+            first_create = not pathlib.Path(args.errors_csv).exists()
+            csv_fp = open(args.errors_csv, 'a')
+            if first_create:
+                csv_fp.write('frame,error1,error2,'
+                              'pelvis_pos_err,left_hand_pos_err,right_hand_pos_err\n')
+            csv_writer = csv_fp
+            print(f"[cyan]Logging per-frame errors to {args.errors_csv}[/cyan]")
+        except Exception as e:
+            print(f"[red]Failed to open errors CSV: {e}[/red]")
+            csv_writer = None
+    # Run retarget with optional logging
     try:
-        retarget_sequence(
-            frames=frames,
-            human_height=human_height,
-            robot=args.robot,
+        retargeter = GMR(
+            src_human="fbx",
+            tgt_robot=args.robot,
+            actual_human_height=human_height,
             solver=args.solver,
-            rate_limit=args.rate_limit,
-            record_video=args.record_video,
-            video_path=args.video_path,
+            verbose=False,
         )
+        fps = 30
+        viewer = RobotMotionViewer(robot_type=args.robot,
+                                   motion_fps=fps,
+                                   record_video=args.record_video,
+                                   video_path=args.video_path)
+        # Pre-fetch mapping for key bodies
+        key_map = {
+            'pelvis': 'Hips',
+            'left_wrist_yaw_link': 'LeftHand',
+            'right_wrist_yaw_link': 'RightHand'
+        }
+        # Helper to fetch robot body world pos
+        def _robot_body_pos(name):
+            try:
+                bid = retargeter.model.body(name).id
+                return retargeter.configuration.data.xpos[bid].copy()
+            except Exception:
+                return np.full(3, np.nan)
+        for f_idx, frame in enumerate(frames):
+            qpos = retargeter.retarget(frame)
+            # Compute errors if requested
+            if args.log_errors or csv_writer:
+                err1 = retargeter.error1() if hasattr(retargeter, 'error1') else np.nan
+                err2 = retargeter.error2() if hasattr(retargeter, 'error2') else np.nan
+                pelvis_err = left_err = right_err = np.nan
+                # After retarget step, robot state in retargeter.configuration
+                if 'Hips' in frame:
+                    robot_pelvis = _robot_body_pos('pelvis')
+                    pelvis_err = np.linalg.norm(robot_pelvis - frame['Hips'][0]) if robot_pelvis.size==3 else np.nan
+                if 'LeftHand' in frame:
+                    robot_lh = _robot_body_pos('left_wrist_yaw_link')
+                    left_err = np.linalg.norm(robot_lh - frame['LeftHand'][0]) if robot_lh.size==3 else np.nan
+                if 'RightHand' in frame:
+                    robot_rh = _robot_body_pos('right_wrist_yaw_link')
+                    right_err = np.linalg.norm(robot_rh - frame['RightHand'][0]) if robot_rh.size==3 else np.nan
+                if args.log_errors and f_idx % 30 == 0:
+                    print(f"[blue]Frame {f_idx:04d} err1={err1:.4f} err2={err2:.4f} | pelvis={pelvis_err:.3f}m LH={left_err:.3f}m RH={right_err:.3f}m[/blue]")
+                if csv_writer:
+                    csv_writer.write(f"{f_idx},{err1},{err2},{pelvis_err},{left_err},{right_err}\n")
+            viewer.step(
+                root_pos=qpos[:3],
+                root_rot=qpos[3:7],
+                dof_pos=qpos[7:],
+                human_motion_data=retargeter.scaled_human_data,
+                rate_limit=args.rate_limit,
+                follow_camera=True,
+            )
+        viewer.close()
     except KeyboardInterrupt:
         print("[yellow]Interrupted by user[/yellow]")
+    finally:
+        if csv_writer:
+            csv_writer.close()
 
 if __name__ == "__main__":  # pragma: no cover
     main()
