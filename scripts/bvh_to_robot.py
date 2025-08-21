@@ -46,6 +46,14 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--solver",
+        type=str,
+        default="daqp",
+        choices=["daqp", "proxqp", "osqp", "quadprog", "cvxopt"],
+        help="QP solver to use inside IK (use 'osqp' if you hit install issues on macOS arm64)",
+    )
+
+    parser.add_argument(
         "--save_path",
         default=None,
         help="Path to save the robot motion.",
@@ -71,6 +79,7 @@ if __name__ == "__main__":
         src_human="bvh",
         tgt_robot=args.robot,
         actual_human_height=actual_human_height,
+    solver=args.solver,
     )
 
     motion_fps = 30
