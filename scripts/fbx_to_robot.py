@@ -625,6 +625,7 @@ def parse_args(argv=None):
     p.add_argument("--log_errors", action="store_true", help="Print per-frame IK task errors and positional discrepancies")
     p.add_argument("--errors_csv", type=str, default=None, help="Path to CSV file to append per-frame errors")
     p.add_argument("--dump_bvh_header", type=int, default=0, help="Print first N lines of BVH file then continue")
+    p.add_argument("--traj_csv", type=str, default=None, help="Write per-frame root trajectory & velocity to CSV (viewer-level)")
     return p.parse_args(argv)
 
 def main(argv=None):
@@ -632,7 +633,10 @@ def main(argv=None):
     if args.fbx_file:
         fbx_path = pathlib.Path(args.fbx_file).expanduser().resolve()
         if not fbx_path.exists():
-            print(f"[red]FBX file not found: {fbx_path}[/red]")
+            if str(fbx_path).startswith('/path/to'):
+                print(f"[red]FBX file not found: {fbx_path}[/red]  Hint: replace placeholder /path/to/file.fbx with a real path.")
+            else:
+                print(f"[red]FBX file not found: {fbx_path}[/red]")
             sys.exit(1)
         if args.out_bvh:
             out_bvh = pathlib.Path(args.out_bvh).expanduser().resolve()
@@ -830,7 +834,8 @@ def main(argv=None):
         viewer = RobotMotionViewer(robot_type=args.robot,
                                    motion_fps=fps,
                                    record_video=args.record_video,
-                                   video_path=args.video_path)
+                                   video_path=args.video_path,
+                                   traj_csv_path=args.traj_csv)
         # Pre-fetch mapping for key bodies
         key_map = {
             'pelvis': 'Hips',

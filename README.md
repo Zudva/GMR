@@ -8,7 +8,7 @@
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"/>
   </a>
   <a href="https://github.com/YanjieZe/GMR/releases">
-    <img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version"/>
+    <img src="https://img.shields.io/badge/version-0.2.0-blue.svg" alt="Version"/>
   </a>
   <a href="https://x.com/ZeYanjie/status/1952446745696469334">
     <img src="https://img.shields.io/badge/twitter-ZeYanjie-blue.svg" alt="Twitter"/>
@@ -28,6 +28,8 @@ Key features of GMR:
 **NOTE: If you want this repo to support a new robot or a new human motion data format, send the robot files (`.xml` (must), `.urdf` (must), and meshes (must)) / human motion data to <a href="mailto:lastyanjieze@gmail.com">Yanjie Ze</a> or create an issue, we will support it as soon as possible.** Please make sure the robot files you sent can be open-sourced in this repo.
 
 This repo is licensed under the [MIT License](LICENSE).
+
+See [CHANGELOG](doc/CHANGELOG.md) for recent updates.
 
 # News & Updates
 
@@ -201,6 +203,59 @@ And then run:
 python scripts/optitrack_to_robot.py --server_ip <server_ip> --client_ip <client_ip> --use_multicast False --robot unitree_g1
 ```
 You should see the visualization of the retargeted robot motion in a mujoco window.
+
+### Offline Processing of an FBX File (FBX -> BVH -> Robot)
+
+We provide an extended pipeline with automatic conversion, orientation correction, normalization, diagnostics and logging via `scripts/fbx_to_robot.py`.
+
+macOS NOTE: launch with `mjpython` (MuJoCo patched python) to open the viewer; running with plain `python` on macOS will raise an error (`launch_passive requires ... mjpython`).
+
+Basic auto-orientation + normalization example:
+```bash
+mjpython scripts/fbx_to_robot.py \
+  --fbx_file /path/to/motion.fbx \
+  --robot unitree_g1 \
+  --always_overwrite \
+  --orient_fix auto --auto_forward_axis x \
+  --normalize_root \
+  --log_errors \
+  --errors_csv errors.csv \
+  --dump_bvh_header 60
+```
+
+Ubisoft axis style (skip extra orientation composition) variant:
+```bash
+mjpython scripts/fbx_to_robot.py \
+  --fbx_file /path/to/motion.fbx \
+  --robot unitree_g1 \
+  --always_overwrite \
+  --ubisoft_axes \
+  --normalize_root \
+  --log_errors --errors_csv errors.csv
+```
+
+Key FBX pipeline flags:
+- `--always_overwrite` force reconversion (ignore existing BVH).
+- `--orient_fix {x90,x-90,y90,y-90,z180,auto,none}` preset or auto-detected global rotation.
+- `--auto_forward_axis {x|y}` desired forward when using `--orient_fix auto`.
+- `--ubisoft_axes` apply only canonical Y-up→Z-up axis fix (skip additional quaternion composition).
+- `--normalize_root` translate initial Hips to origin and move floor (estimated from feet) to z=0.
+- `--dump_bvh_header N` print first N lines of the BVH for channel/joint inspection.
+- `--force_generic_loader` bypass strict lafan loader; use generic parser.
+- Error diagnostics: `--log_errors` (console every ~30 frames) + `--errors_csv path` (per-frame CSV: frame,error1,error2,pelvis_pos_err,left_hand_pos_err,right_hand_pos_err).
+
+Viewer overlay (enabled by default) displays root XYZ, velocity, and yaw/pitch/roll; trajectory CSV logging is available programmatically (constructor parameter) and will be exposed via CLI in a future update.
+
+If a BVH already exists and you only want to inspect its header and play it:
+```bash
+mjpython scripts/fbx_to_robot.py --bvh_file /path/to/file.bvh --robot unitree_g1 --dump_bvh_header 80 --log_errors
+```
+
+Troubleshooting tips:
+- Static (T-pose) export: re-run with `--always_overwrite --use_blender` ensuring the FBX has keyframes.
+- Lying / rotated avatar: try `--orient_fix auto` or a preset (e.g. `--orient_fix x90`).
+- Parser reshape/channel errors: add `--force_generic_loader` (automatic loose fallback also triggers when strict parsing fails).
+- Almost zero motion variance warning: verify animation baked correctly in Blender; ensure correct armature selected.
 
 
 ## Visualize saved robot motion
