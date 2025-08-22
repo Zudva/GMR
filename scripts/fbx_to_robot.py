@@ -624,6 +624,7 @@ def parse_args(argv=None):
     p.add_argument("--pelvis_pos_w2", type=float, default=None, help="Override pelvis position weight in ik_match_table2 (stage2)")
     p.add_argument("--task_error_breakdown", action="store_true", help="Print per-task error contributions every 60 frames for debugging")
     p.add_argument("--align_root_xy", type=str, default=None, help="Horizontally align (X,Y) human root to robot pelvis before IK. Use 'auto' to match robot pelvis first-frame xy; or provide 'x,y' numeric target world coords (meters). Applied AFTER pelvis_z_offset.")
+    p.add_argument("--use_root_motion", action="store_true", help="Directly copy human Hips translation to robot base (qpos[:3]) each frame (bypasses relying solely on IK for root drift)")
     p.add_argument("--orient_fix", type=str, default="none", choices=["none","x90","x-90","y90","y-90","z180","auto"], help="Orientation fix: preset rotation or auto (detect up/forward)")
     p.add_argument("--auto_forward_axis", type=str, default="x", choices=["x","y"], help="Desired forward axis for --orient_fix auto (default x)")
     p.add_argument("--ubisoft_axes", action="store_true", help="Force lafan1(Ubisoft) axis convention only (Y-up->Z-up) and skip extra orient composition")
@@ -634,6 +635,12 @@ def parse_args(argv=None):
     p.add_argument("--dump_bvh_header", type=int, default=0, help="Print first N lines of BVH file then continue")
     p.add_argument("--debug_alignment", action="store_true", help="Print joint positions at stages: initial -> after auto orient -> after normalization")
     p.add_argument("--traj_csv", type=str, default=None, help="Write per-frame root trajectory & velocity to CSV (viewer-level)")
+    p.add_argument("--debug_initial_targets", action="store_true", help="After loading & scaling (before loop) print human target vs current robot body positions and deltas for key joints")
+    p.add_argument("--auto_pelvis_offset", type=str, default=None, help="Auto-compute pelvis positional offset in IK (add to pos_offset for pelvis tasks) so constant morphology bias is removed. Value specifies axes to apply, e.g. 'xy' (default) or 'xyz'.")
+    p.add_argument("--debug_pelvis_anchor", action="store_true", help="During retarget loop print distances robot pelvis -> human (Hips, LeftUpLeg, RightUpLeg) every 30 frames to see what it follows")
+    p.add_argument("--camera_dist", type=float, default=None, help="Override viewer camera distance (further away if value > default)")
+    p.add_argument("--suggest_offsets", type=float, default=None, help="Analyze first frame and suggest pos_offset (global approx) for bodies with |delta| > threshold (meters). Provide threshold value, e.g. 0.15")
+    p.add_argument("--apply_suggested_offsets", action="store_true", help="Immediately apply suggested offsets to runtime (not modifying JSON file) after computing them")
     return p.parse_args(argv)
 
 def main(argv=None):
@@ -720,6 +727,7 @@ def main(argv=None):
 
     # (Normalization moved after auto orientation below)
 
+    original_hips_traj = None  # will hold original (pre-normalization) hips positions per frame for root motion
     # Auto orientation (post-load rotation). Rotate about initial hips pivot to avoid large translational drift.
     if args.orient_fix == 'auto':
         def _get(name, fr):
@@ -786,6 +794,9 @@ def main(argv=None):
                     p = frames[0][k][0]
                     print(f"  {k:12s} {p}")
 
+    # Before normalization, capture hips trajectory (if present)
+    if 'Hips' in frames[0]:
+        original_hips_traj = [fr['Hips'][0].copy() for fr in frames]
     # Root normalization now (after orientation), keeps feet on floor and hips at origin
     if args.normalize_root and 'Hips' in frames[0]:
         root0 = frames[0]['Hips'][0].copy()
@@ -945,6 +956,123 @@ def main(argv=None):
             tbl['pelvis'][1] = args.pelvis_pos_w1
             if args.log_errors:
                 print(f"[cyan]Override pelvis pos weight stage1 -> {args.pelvis_pos_w1}")
+
+    # Optional: auto pelvis offset to remove constant bias (e.g., ~0.6m) between robot pelvis and human hips
+    if args.auto_pelvis_offset:
+        axis_spec = args.auto_pelvis_offset.strip().lower()
+        if axis_spec == '':
+            axis_spec = 'xy'
+        # Prepare one human frame (first) without modifying original structure
+        if len(frames) > 0 and 'Hips' in frames[0]:
+            # Build a temp copy for computing scaled human targets like update_targets does (stage1 offsets applied)
+            temp_frame = {k:(v[0].copy(), v[1].copy()) for k,v in frames[0].items()}
+            # Emulate scaling & offsets pipeline minimally
+            from copy import deepcopy as _dc
+            _tmp = {k:[v[0].copy(), v[1].copy()] for k,v in temp_frame.items()}
+            # scale_human_data expects dict of lists
+            _tmp = retargeter.scale_human_data(_tmp, retargeter.human_root_name, retargeter.human_scale_table)
+            # Apply current (possibly modified) pos_offsets1/rot_offsets1 for pelvis only (others not needed)
+            pelvis_task_entry1 = retargeter.ik_match_table1.get('pelvis')
+            if pelvis_task_entry1:
+                # Use existing pos_offsets1/rot_offsets1 logic by calling offset_human_data but restricted to pelvis
+                # For simplicity, call full function (safe)
+                _tmp = retargeter.offset_human_data(_tmp, retargeter.pos_offsets1, retargeter.rot_offsets1)
+            human_pelvis_pos = _tmp['Hips'][0]
+            try:
+                pelvis_bid = retargeter.model.body('pelvis').id
+                robot_pelvis_pos = retargeter.configuration.data.xpos[pelvis_bid].copy()
+            except Exception:
+                robot_pelvis_pos = human_pelvis_pos.copy()
+            delta = robot_pelvis_pos - human_pelvis_pos
+            apply_mask = np.array([
+                1 if 'x' in axis_spec else 0,
+                1 if 'y' in axis_spec else 0,
+                1 if 'z' in axis_spec else 0,
+            ], dtype=float)
+            adj = delta * apply_mask
+            if np.linalg.norm(adj) > 0:
+                # Inject into pelvis pos_offset for both tables (offsets are LOCAL; we treat this as global approximation)
+                for tbl_name, pos_offsets in [('stage1', retargeter.pos_offsets1), ('stage2', retargeter.pos_offsets2)]:
+                    if 'Hips' in pos_offsets:
+                        pos_offsets['Hips'] = pos_offsets['Hips'] + adj
+                if args.log_errors or True:
+                    print(f"[cyan]Auto pelvis offset applied ({axis_spec}): delta={delta.round(3)} -> added {adj.round(3)} to pelvis pos_offsets (stage1/2)")
+            else:
+                print("[yellow]Auto pelvis offset: zero adjustment; skipped")
+        else:
+            print("[red]Auto pelvis offset requested but Hips not in first frame; skipping")
+
+    # Optionally print initial targets vs robot bodies
+    if args.debug_initial_targets:
+        try:
+            sample = frames[0]
+            # Run full update pipeline once to populate scaled_human_data
+            retargeter.update_targets({k:(v[0].copy(), v[1].copy()) for k,v in sample.items()})
+            key_pairs = [
+                ('pelvis','Hips'),
+                ('left_toe_link','LeftToeBase'),
+                ('right_toe_link','RightToeBase'),
+                ('left_wrist_yaw_link','LeftHand'),
+                ('right_wrist_yaw_link','RightHand'),
+                ('torso_link','Spine1'),
+            ]
+            print('[magenta]Initial target vs robot body deltas: (robot - human)')
+            for robot_body, human_key in key_pairs:
+                if human_key not in retargeter.scaled_human_data:
+                    continue
+                hpos = retargeter.scaled_human_data[human_key][0]
+                try:
+                    bid = retargeter.model.body(robot_body).id
+                    rpos = retargeter.configuration.data.xpos[bid].copy()
+                except Exception:
+                    continue
+                d = rpos - hpos
+                print(f"  {robot_body:22s} - {human_key:12s}: human={hpos.round(3)} robot={rpos.round(3)} delta={d.round(3)} | |delta|={np.linalg.norm(d):.3f}")
+        except Exception as _e:
+            print(f"[red]Failed debug_initial_targets: {_e}")
+
+    # Suggest offsets for large deltas (approximate global -> local) BEFORE loop
+    if args.suggest_offsets is not None:
+        try:
+            thresh = float(args.suggest_offsets)
+        except ValueError:
+            thresh = 0.15
+        # Ensure scaled_human_data available
+        if 'scaled_human_data' not in retargeter.__dict__:
+            sample = frames[0]
+            retargeter.update_targets({k:(v[0].copy(), v[1].copy()) for k,v in sample.items()})
+        print(f"[cyan]Suggesting pos_offset adjustments (threshold={thresh:.3f} m)...[/cyan]")
+        suggestions = []
+        # Combine stage2 table keys (they have position weights) prioritizing them
+        for frame_name, entry in retargeter.ik_match_table2.items():
+            body_name, pos_w, rot_w, pos_off, rot_off = entry
+            if body_name not in retargeter.scaled_human_data:
+                continue
+            try:
+                bid = retargeter.model.body(frame_name).id
+            except Exception:
+                continue
+            human_pos = retargeter.scaled_human_data[body_name][0]
+            robot_pos = retargeter.configuration.data.xpos[bid].copy()
+            delta = human_pos - robot_pos  # we want robot to move toward human
+            mag = float(np.linalg.norm(delta))
+            if mag >= thresh:
+                suggestions.append((frame_name, body_name, delta, mag))
+        if not suggestions:
+            print('[green]No bodies exceed threshold; no suggestions.[/green]')
+        else:
+            print('[magenta]Suggested additions to pos_offset (approx global delta; paste into corresponding ik_match_table entries):')
+            for frame_name, body_name, delta, mag in suggestions:
+                d = delta.round(3)
+                print(f"  {frame_name:22s} ({body_name:12s}) |delta|={mag:.3f} -> pos_offset += {d.tolist()}")
+            if args.apply_suggested_offsets:
+                # Apply by adding to current runtime pos_offsets1/2 (treating delta as local approximation)
+                for frame_name, body_name, delta, mag in suggestions:
+                    if body_name in retargeter.pos_offsets1:
+                        retargeter.pos_offsets1[body_name] = retargeter.pos_offsets1[body_name] + delta
+                    if body_name in retargeter.pos_offsets2:
+                        retargeter.pos_offsets2[body_name] = retargeter.pos_offsets2[body_name] + delta
+                print('[cyan]Applied suggested offsets to runtime (JSON unchanged).[/cyan]')
     if args.pelvis_pos_w2 is not None and hasattr(retargeter, 'ik_match_table2'):
         tbl = retargeter.ik_match_table2
         if 'pelvis' in tbl:
@@ -957,7 +1085,8 @@ def main(argv=None):
                                motion_fps=fps,
                                record_video=args.record_video,
                                video_path=args.video_path,
-                               traj_csv_path=args.traj_csv)
+                               traj_csv_path=args.traj_csv,
+                               camera_distance_override=args.camera_dist)
     # Pre-fetch mapping for key bodies
     key_map = {
         'pelvis': 'Hips',
@@ -973,6 +1102,25 @@ def main(argv=None):
             return np.full(3, np.nan)
     for f_idx, frame in enumerate(frames):
         qpos = retargeter.retarget(frame)
+        if args.use_root_motion and original_hips_traj is not None and f_idx < len(original_hips_traj):
+            # Use the (pre-normalization) hips trajectory as world translation. If normalization removed an initial offset dz, we already subtracted; add raw directly.
+            qpos[:3] = original_hips_traj[f_idx]
+
+        if args.debug_pelvis_anchor and (f_idx % 30 == 0):
+            try:
+                pelvis_bid = retargeter.model.body('pelvis').id
+                rpelvis = retargeter.configuration.data.xpos[pelvis_bid].copy()
+                human_targets = getattr(retargeter, 'scaled_human_data', frame)
+                def _dist(name):
+                    if name in human_targets:
+                        return float(np.linalg.norm(rpelvis - human_targets[name][0]))
+                    return float('nan')
+                d_hips = _dist('Hips')
+                d_lup = _dist('LeftUpLeg')
+                d_rup = _dist('RightUpLeg')
+                print(f"[magenta]PelvisAnchor f{f_idx:04d}: |pelvis-Hips|={d_hips:.3f} |pelvis-LeftUpLeg|={d_lup:.3f} |pelvis-RightUpLeg|={d_rup:.3f}")
+            except Exception as _e:
+                print(f"[red]pelvis_anchor debug failed: {_e}")
         # Compute errors if requested
         if args.log_errors or csv_writer:
             err1 = retargeter.error1() if hasattr(retargeter, 'error1') else np.nan

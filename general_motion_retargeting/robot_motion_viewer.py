@@ -44,27 +44,29 @@ def draw_frame(
 
 class RobotMotionViewer:
     def __init__(self,
-                robot_type,
-                camera_follow=True,
-                motion_fps=30,
-                transparent_robot=0,
-                # video recording
-                record_video=False,
-                video_path=None,
-                video_width=640,
-                video_height=480,
-                show_robot_coords=True,
-                traj_csv_path=None,
-                show_orientation=True):
-        
+                 robot_type,
+                 camera_follow=True,
+                 motion_fps=30,
+                 transparent_robot=0,
+                 # video recording
+                 record_video=False,
+                 video_path=None,
+                 video_width=640,
+                 video_height=480,
+                 show_robot_coords=True,
+                 traj_csv_path=None,
+                 show_orientation=True,
+                 camera_distance_override=None):
+
         self.robot_type = robot_type
         self.xml_path = ROBOT_XML_DICT[robot_type]
         self.model = mj.MjModel.from_xml_path(str(self.xml_path))
         self.data = mj.MjData(self.model)
         self.robot_base = ROBOT_BASE_DICT[robot_type]
         self.viewer_cam_distance = VIEWER_CAM_DISTANCE_DICT[robot_type]
+        self.camera_distance_override = camera_distance_override
         mj.mj_step(self.model, self.data)
-        
+
         self.motion_fps = motion_fps
         self.rate_limiter = RateLimiter(frequency=self.motion_fps, warn=False)
         self.camera_follow = camera_follow
@@ -94,17 +96,17 @@ class RobotMotionViewer:
             show_right_ui=False)
 
         self.viewer.opt.flags[mj.mjtVisFlag.mjVIS_TRANSPARENT] = transparent_robot
-        
+
         if self.record_video:
             assert video_path is not None, "Please provide video path for recording"
             self.video_path = video_path
             video_dir = os.path.dirname(self.video_path)
-            
+
             if not os.path.exists(video_dir):
                 os.makedirs(video_dir)
             self.mp4_writer = imageio.get_writer(self.video_path, fps=self.motion_fps)
             print(f"Recording video to {self.video_path}")
-            
+
             # Initialize renderer for video recording
             self.renderer = mj.Renderer(self.model, height=video_height, width=video_width)
         
@@ -142,7 +144,8 @@ class RobotMotionViewer:
         
         if follow_camera:
             self.viewer.cam.lookat = self.data.xpos[self.model.body(self.robot_base).id]
-            self.viewer.cam.distance = self.viewer_cam_distance
+            # Apply distance override if provided
+            self.viewer.cam.distance = self.camera_distance_override if self.camera_distance_override is not None else self.viewer_cam_distance
             self.viewer.cam.elevation = -10  # 正面视角，轻微向下看
             # self.viewer.cam.azimuth = 180    # 正面朝向机器人
 
