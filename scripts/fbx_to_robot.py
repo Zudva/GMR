@@ -489,7 +489,8 @@ for k,v in _EXTENDED_SYNONYMS.items():
 
 # Additional ActorCore CC_Base_* synonyms
 _CC_BASE = {
-    "Hips": ["CC_Base_Hip","CC_Base_Pelvis","CC_Base_BoneRoot"],
+    # Reordered preference: Pelvis first (better anatomical root), then Hip, then BoneRoot
+    "Hips": ["CC_Base_Pelvis","CC_Base_Hip","CC_Base_BoneRoot"],
     "Spine1": ["CC_Base_Waist","CC_Base_Spine01","CC_Base_Spine02"],
     "LeftUpLeg": ["CC_Base_L_Thigh"],
     "RightUpLeg": ["CC_Base_R_Thigh"],
@@ -617,6 +618,12 @@ def parse_args(argv=None):
     p.add_argument("--keep_temp_script", action="store_true", help="Do not delete generated temporary Blender script (for debugging)")
     p.add_argument("--stream_blender", action="store_true", help="Stream Blender stdout/stderr directly instead of capturing")
     p.add_argument("--force_generic_loader", action="store_true", help="Skip lafan1 loader and use generic BVH parser always")
+    p.add_argument("--pelvis_z_offset", type=str, default=None, help="Add constant Z offset (meters) to all human joints AFTER normalization to better match robot pelvis height; pass 'auto' to auto-compute from robot pelvis vs human hips first-frame heights")
+    p.add_argument("--no_scale_human", action="store_true", help="Disable human limb scaling (set all human_scale_table factors to 1.0) for diagnostics")
+    p.add_argument("--pelvis_pos_w1", type=float, default=None, help="Override pelvis position weight in ik_match_table1 (stage1) to pull root earlier")
+    p.add_argument("--pelvis_pos_w2", type=float, default=None, help="Override pelvis position weight in ik_match_table2 (stage2)")
+    p.add_argument("--task_error_breakdown", action="store_true", help="Print per-task error contributions every 60 frames for debugging")
+    p.add_argument("--align_root_xy", type=str, default=None, help="Horizontally align (X,Y) human root to robot pelvis before IK. Use 'auto' to match robot pelvis first-frame xy; or provide 'x,y' numeric target world coords (meters). Applied AFTER pelvis_z_offset.")
     p.add_argument("--orient_fix", type=str, default="none", choices=["none","x90","x-90","y90","y-90","z180","auto"], help="Orientation fix: preset rotation or auto (detect up/forward)")
     p.add_argument("--auto_forward_axis", type=str, default="x", choices=["x","y"], help="Desired forward axis for --orient_fix auto (default x)")
     p.add_argument("--ubisoft_axes", action="store_true", help="Force lafan1(Ubisoft) axis convention only (Y-up->Z-up) and skip extra orient composition")
@@ -625,6 +632,7 @@ def parse_args(argv=None):
     p.add_argument("--log_errors", action="store_true", help="Print per-frame IK task errors and positional discrepancies")
     p.add_argument("--errors_csv", type=str, default=None, help="Path to CSV file to append per-frame errors")
     p.add_argument("--dump_bvh_header", type=int, default=0, help="Print first N lines of BVH file then continue")
+    p.add_argument("--debug_alignment", action="store_true", help="Print joint positions at stages: initial -> after auto orient -> after normalization")
     p.add_argument("--traj_csv", type=str, default=None, help="Write per-frame root trajectory & velocity to CSV (viewer-level)")
     return p.parse_args(argv)
 
@@ -710,27 +718,13 @@ def main(argv=None):
             print("[yellow]--ubisoft_axes overrides --orient_fix preset; ignoring preset rotation[/yellow]")
         # No post rotation adjustment applied (frames already rotated by axis fix earlier)
 
-    # Root normalization (after auto/orient fix so it applies to final positions)
-    if args.normalize_root:
-        if "Hips" in frames[0]:
-            root0 = frames[0]["Hips"][0].copy()
-            # Estimate floor from feet if available
-            feet_z = []
-            for k in ["LeftToeBase","RightToeBase","LeftFoot","RightFoot","LeftFootMod","RightFootMod"]:
-                if k in frames[0]:
-                    feet_z.append(frames[0][k][0][2])
-            floor_z = min(feet_z) if feet_z else root0[2]
-            dz = root0.copy(); dz[2] = floor_z  # translation to move hips.x/y to origin, feet to 0
-            for fr in frames:
-                for name,(p,q) in fr.items():
-                    fr[name] = (p - dz, q)
-            print(f"[cyan]Normalized root: shifted by {dz} (floor_z={floor_z:.3f})[/cyan]")
+    # (Normalization moved after auto orientation below)
 
-    # Auto orientation (post-load rotation of frames)
+    # Auto orientation (post-load rotation). Rotate about initial hips pivot to avoid large translational drift.
     if args.orient_fix == 'auto':
         def _get(name, fr):
             return fr.get(name, (None,None))[0]
-        ref = frames[min(10, len(frames)-1)]  # use an early frame but not necessarily first (in case of T-pose)
+        ref = frames[min(10, len(frames)-1)]  # early frame for basis detection
         hips = _get('Hips', ref)
         head = _get('Head', ref) or _get('Spine1', ref)
         lhip = _get('LeftUpLeg', ref)
@@ -770,13 +764,46 @@ def main(argv=None):
         qcorr = R.from_matrix(Rcorr).as_quat(scalar_first=True)
         ORIENT_FIX_QUAT = qcorr
         print(f"[cyan]Auto orientation: up={up_vec}, fwd={fwd} -> quat={ORIENT_FIX_QUAT}")
-        # Apply to frames (positions & orientations)
+        hip_pivot = frames[0]['Hips'][0].copy() if 'Hips' in frames[0] else np.zeros(3)
+        # Debug capture initial before rotation
+        if args.debug_alignment:
+            keys_dbg = ['Hips','LeftHand','RightHand','LeftFoot','RightFoot','LeftToeBase','RightToeBase','LeftFootMod','RightFootMod']
+            print('[magenta]Alignment stage: initial positions (first frame)')
+            for k in keys_dbg:
+                if k in frames[0]:
+                    p = frames[0][k][0]
+                    print(f"  {k:12s} {p}")
+        # Apply rotation about hip pivot
         for fr in frames:
             for k,(p,q) in fr.items():
-                p2 = p @ Rcorr.T
-                # qcorr ⊗ q (using quat_mul(q, qcorr)) because quat_mul returns second * first
-                q2 = _lafan_utils.quat_mul(q, qcorr)
+                p2 = (p - hip_pivot) @ Rcorr.T + hip_pivot
+                q2 = _lafan_utils.quat_mul(q, qcorr)  # qcorr ⊗ q
                 fr[k] = (p2, q2)
+        if args.debug_alignment:
+            print('[magenta]Alignment stage: after auto orientation (first frame)')
+            for k in keys_dbg:
+                if k in frames[0]:
+                    p = frames[0][k][0]
+                    print(f"  {k:12s} {p}")
+
+    # Root normalization now (after orientation), keeps feet on floor and hips at origin
+    if args.normalize_root and 'Hips' in frames[0]:
+        root0 = frames[0]['Hips'][0].copy()
+        feet_z = []
+        for k in ["LeftToeBase","RightToeBase","LeftFoot","RightFoot","LeftFootMod","RightFootMod"]:
+            if k in frames[0]:
+                feet_z.append(frames[0][k][0][2])
+        floor_z = min(feet_z) if feet_z else root0[2]
+        dz = root0.copy(); dz[2] = floor_z
+        for fr in frames:
+            for name,(p,q) in fr.items():
+                fr[name] = (p - dz, q)
+        if args.debug_alignment:
+            print('[magenta]Alignment stage: after normalization (first frame)')
+            for k in ['Hips','LeftHand','RightHand','LeftFoot','RightFoot']:
+                if k in frames[0]:
+                    print(f"  {k:10s} {frames[0][k][0]}")
+        print(f"[cyan]Normalized root: shifted by {dz} (floor_z={floor_z:.3f})[/cyan]")
 
     if args.debug_stats:
         def _variance(a):
@@ -807,6 +834,81 @@ def main(argv=None):
             if np.max(bbox) < 1e-3:
                 print("[red]Detected almost zero root motion. Likely export did not bake animation. Re-run with --use_blender --overwrite after ensuring actions exist, or verify FBX has keyframes.[/red]")
     print(f"Loaded {len(frames)} frames (assumed FPS=30), human_height={human_height:.2f}m")
+
+    # Optional pelvis Z offset tweak (diagnostic) applied AFTER normalization/orientation
+    if args.pelvis_z_offset and frames:
+        try:
+            if args.pelvis_z_offset.strip().lower() == 'auto':
+                # Lazy load robot model to get current pelvis height (qpos zero) for comparison
+                try:
+                    from general_motion_retargeting.params import ROBOT_XML_DICT
+                    model_path = str(ROBOT_XML_DICT[args.robot])
+                    import mujoco as mj
+                    mdl = mj.MjModel.from_xml_path(model_path)
+                    data = mj.MjData(mdl)
+                    mj.mj_forward(mdl, data)
+                    pelvis_body = mdl.body('pelvis') if hasattr(mdl, 'body') else None
+                    if pelvis_body is not None:
+                        pelvis_id = mdl.body('pelvis').id
+                        robot_pelvis_z = float(data.xpos[pelvis_id][2])
+                    else:
+                        robot_pelvis_z = 0.0
+                except Exception:
+                    robot_pelvis_z = 0.0
+                human_hips_z = float(frames[0]['Hips'][0][2]) if 'Hips' in frames[0] else 0.0
+                offset_val = robot_pelvis_z - human_hips_z
+                print(f"[cyan]Auto pelvis_z_offset: robot pelvis z={robot_pelvis_z:.3f} human hips z={human_hips_z:.3f} -> applying offset {offset_val:.3f} m[/cyan]")
+            else:
+                offset_val = float(args.pelvis_z_offset)
+                print(f"[cyan]Manual pelvis_z_offset: applying {offset_val:.3f} m[/cyan]")
+            if abs(offset_val) > 5:
+                print(f"[yellow]pelvis_z_offset magnitude {offset_val} seems large; ignoring.[/yellow]")
+            else:
+                for fr in frames:
+                    for k,(p,q) in fr.items():
+                        fr[k] = (p + np.array([0,0,offset_val]), q)
+        except ValueError:
+            print(f"[red]Invalid --pelvis_z_offset value: {args.pelvis_z_offset} (expected float or 'auto')[/red]")
+
+    # Optional horizontal root alignment (after vertical offset)
+    if args.align_root_xy and frames:
+        try:
+            if args.align_root_xy.strip().lower() == 'auto':
+                try:
+                    from general_motion_retargeting.params import ROBOT_XML_DICT
+                    import mujoco as mj
+                    model_path = str(ROBOT_XML_DICT[args.robot])
+                    mdl = mj.MjModel.from_xml_path(model_path)
+                    data = mj.MjData(mdl)
+                    mj.mj_forward(mdl, data)
+                    pelvis_id = mdl.body('pelvis').id
+                    target_xy = data.xpos[pelvis_id][:2].copy()
+                except Exception:
+                    target_xy = np.array([0.0,0.0])
+                if 'Hips' in frames[0]:
+                    current_xy = frames[0]['Hips'][0][:2]
+                    delta_xy = target_xy - current_xy
+                else:
+                    delta_xy = np.array([0.0,0.0])
+                print(f"[cyan]Auto align_root_xy: applying delta {delta_xy} m to all joints (XY only)")
+            else:
+                # Expect "x,y"
+                parts = [p for p in args.align_root_xy.replace(';',',').split(',') if p.strip()]
+                if len(parts) != 2:
+                    raise ValueError("Expected two comma-separated numbers for --align_root_xy")
+                target_xy = np.array([float(parts[0]), float(parts[1])])
+                current_xy = frames[0]['Hips'][0][:2] if 'Hips' in frames[0] else target_xy
+                delta_xy = target_xy - current_xy
+                print(f"[cyan]Manual align_root_xy: moving XY by {delta_xy} m")
+            if np.linalg.norm(delta_xy) > 20:
+                print(f"[yellow]align_root_xy delta {delta_xy} seems huge; ignoring.[/yellow]")
+            else:
+                for fr in frames:
+                    for k,(p,q) in fr.items():
+                        fr[k] = (p + np.array([delta_xy[0], delta_xy[1], 0.0]), q)
+        except Exception as e:
+            print(f"[red]Invalid --align_root_xy value ({args.align_root_xy}): {e}[/red]")
+
     # Prepare error CSV if requested
     csv_writer = None
     if args.errors_csv:
@@ -822,68 +924,97 @@ def main(argv=None):
             print(f"[red]Failed to open errors CSV: {e}[/red]")
             csv_writer = None
     # Run retarget with optional logging
-    try:
-        retargeter = GMR(
-            src_human="fbx",
-            tgt_robot=args.robot,
-            actual_human_height=human_height,
-            solver=args.solver,
-            verbose=False,
+    retargeter = GMR(
+        src_human="fbx",
+        tgt_robot=args.robot,
+        actual_human_height=human_height,
+        solver=args.solver,
+        verbose=False,
+    )
+    if args.no_scale_human:
+        # Override all scale factors to 1.0 (diagnostic mode)
+        for k in retargeter.human_scale_table.keys():
+            retargeter.human_scale_table[k] = 1.0
+        if args.log_errors:
+            print("[yellow]Human scaling disabled (--no_scale_human); using unscaled limb lengths.[/yellow]")
+    # Override pelvis weights if requested
+    if args.pelvis_pos_w1 is not None and hasattr(retargeter, 'human_body_to_task1'):
+        tbl = retargeter.ik_match_table1
+        if 'pelvis' in tbl:
+            body_name, _, rot_w, pos_off, rot_off = tbl['pelvis']
+            tbl['pelvis'][1] = args.pelvis_pos_w1
+            if args.log_errors:
+                print(f"[cyan]Override pelvis pos weight stage1 -> {args.pelvis_pos_w1}")
+    if args.pelvis_pos_w2 is not None and hasattr(retargeter, 'ik_match_table2'):
+        tbl = retargeter.ik_match_table2
+        if 'pelvis' in tbl:
+            body_name, _, rot_w, pos_off, rot_off = tbl['pelvis']
+            tbl['pelvis'][1] = args.pelvis_pos_w2
+            if args.log_errors:
+                print(f"[cyan]Override pelvis pos weight stage2 -> {args.pelvis_pos_w2}")
+    fps = 30
+    viewer = RobotMotionViewer(robot_type=args.robot,
+                               motion_fps=fps,
+                               record_video=args.record_video,
+                               video_path=args.video_path,
+                               traj_csv_path=args.traj_csv)
+    # Pre-fetch mapping for key bodies
+    key_map = {
+        'pelvis': 'Hips',
+        'left_wrist_yaw_link': 'LeftHand',
+        'right_wrist_yaw_link': 'RightHand'
+    }
+    # Helper to fetch robot body world pos
+    def _robot_body_pos(name):
+        try:
+            bid = retargeter.model.body(name).id
+            return retargeter.configuration.data.xpos[bid].copy()
+        except Exception:
+            return np.full(3, np.nan)
+    for f_idx, frame in enumerate(frames):
+        qpos = retargeter.retarget(frame)
+        # Compute errors if requested
+        if args.log_errors or csv_writer:
+            err1 = retargeter.error1() if hasattr(retargeter, 'error1') else np.nan
+            err2 = retargeter.error2() if hasattr(retargeter, 'error2') else np.nan
+            pelvis_err = left_err = right_err = np.nan
+            human_targets = getattr(retargeter, 'scaled_human_data', frame)
+            if 'Hips' in human_targets:
+                robot_pelvis = _robot_body_pos('pelvis')
+                pelvis_err = np.linalg.norm(robot_pelvis - human_targets['Hips'][0]) if robot_pelvis.size==3 else np.nan
+            if 'LeftHand' in human_targets:
+                robot_lh = _robot_body_pos('left_wrist_yaw_link')
+                left_err = np.linalg.norm(robot_lh - human_targets['LeftHand'][0]) if robot_lh.size==3 else np.nan
+            if 'RightHand' in human_targets:
+                robot_rh = _robot_body_pos('right_wrist_yaw_link')
+                right_err = np.linalg.norm(robot_rh - human_targets['RightHand'][0]) if robot_rh.size==3 else np.nan
+            if args.log_errors and f_idx % 30 == 0:
+                print(f"[blue]Frame {f_idx:04d} err1={err1:.4f} err2={err2:.4f} | pelvis={pelvis_err:.3f}m LH={left_err:.3f}m RH={right_err:.3f}m[/blue]")
+            if args.task_error_breakdown and f_idx % 60 == 0:
+                try:
+                    import numpy as _np
+                    def _task_errs(tasks):
+                        return {t.frame_name: float(_np.linalg.norm(t.compute_error(retargeter.configuration))) for t in tasks}
+                    errs1 = _task_errs(getattr(retargeter, 'tasks1', []))
+                    errs2 = _task_errs(getattr(retargeter, 'tasks2', []))
+                    print('[magenta]Task error breakdown (stage1 / stage2):')
+                    for name in sorted(set(errs1)|set(errs2)):
+                        print(f"  {name:20s} {errs1.get(name, float('nan')):8.4f} | {errs2.get(name, float('nan')):8.4f}")
+                except Exception as _e:
+                    print(f"[red]Failed task error breakdown: {_e}")
+            if csv_writer:
+                csv_writer.write(f"{f_idx},{err1},{err2},{pelvis_err},{left_err},{right_err}\n")
+        viewer.step(
+            root_pos=qpos[:3],
+            root_rot=qpos[3:7],
+            dof_pos=qpos[7:],
+            human_motion_data=retargeter.scaled_human_data,
+            rate_limit=args.rate_limit,
+            follow_camera=True,
         )
-        fps = 30
-        viewer = RobotMotionViewer(robot_type=args.robot,
-                                   motion_fps=fps,
-                                   record_video=args.record_video,
-                                   video_path=args.video_path,
-                                   traj_csv_path=args.traj_csv)
-        # Pre-fetch mapping for key bodies
-        key_map = {
-            'pelvis': 'Hips',
-            'left_wrist_yaw_link': 'LeftHand',
-            'right_wrist_yaw_link': 'RightHand'
-        }
-        # Helper to fetch robot body world pos
-        def _robot_body_pos(name):
-            try:
-                bid = retargeter.model.body(name).id
-                return retargeter.configuration.data.xpos[bid].copy()
-            except Exception:
-                return np.full(3, np.nan)
-        for f_idx, frame in enumerate(frames):
-            qpos = retargeter.retarget(frame)
-            # Compute errors if requested
-            if args.log_errors or csv_writer:
-                err1 = retargeter.error1() if hasattr(retargeter, 'error1') else np.nan
-                err2 = retargeter.error2() if hasattr(retargeter, 'error2') else np.nan
-                pelvis_err = left_err = right_err = np.nan
-                # After retarget step, robot state in retargeter.configuration
-                if 'Hips' in frame:
-                    robot_pelvis = _robot_body_pos('pelvis')
-                    pelvis_err = np.linalg.norm(robot_pelvis - frame['Hips'][0]) if robot_pelvis.size==3 else np.nan
-                if 'LeftHand' in frame:
-                    robot_lh = _robot_body_pos('left_wrist_yaw_link')
-                    left_err = np.linalg.norm(robot_lh - frame['LeftHand'][0]) if robot_lh.size==3 else np.nan
-                if 'RightHand' in frame:
-                    robot_rh = _robot_body_pos('right_wrist_yaw_link')
-                    right_err = np.linalg.norm(robot_rh - frame['RightHand'][0]) if robot_rh.size==3 else np.nan
-                if args.log_errors and f_idx % 30 == 0:
-                    print(f"[blue]Frame {f_idx:04d} err1={err1:.4f} err2={err2:.4f} | pelvis={pelvis_err:.3f}m LH={left_err:.3f}m RH={right_err:.3f}m[/blue]")
-                if csv_writer:
-                    csv_writer.write(f"{f_idx},{err1},{err2},{pelvis_err},{left_err},{right_err}\n")
-            viewer.step(
-                root_pos=qpos[:3],
-                root_rot=qpos[3:7],
-                dof_pos=qpos[7:],
-                human_motion_data=retargeter.scaled_human_data,
-                rate_limit=args.rate_limit,
-                follow_camera=True,
-            )
-        viewer.close()
-    except KeyboardInterrupt:
-        print("[yellow]Interrupted by user[/yellow]")
-    finally:
-        if csv_writer:
-            csv_writer.close()
+    viewer.close()
+    if csv_writer:
+        csv_writer.close()
 
 if __name__ == "__main__":  # pragma: no cover
     main()
