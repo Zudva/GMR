@@ -175,11 +175,37 @@ By default there is no visualization for batch retargeting.
 
 Retarget a single motion:
 ```bash
-# single motion
-python scripts/bvh_to_robot.py --bvh_file <path_to_bvh_data> --robot <path_to_robot_data> --save_path <path_to_save_robot_data.pkl> --rate_limit
+# single motion (Linux)
+python scripts/bvh_to_robot.py --bvh_file <path_to_bvh_data> --robot <robot_name> --save_path <out.pkl> --rate_limit
+
+# macOS (нужно окно MuJoCo) → запускать через mjpython
+mjpython scripts/bvh_to_robot.py --bvh_file <path_to_bvh_data> --robot <robot_name> --save_path <out.pkl> --rate_limit
 ```
 By default you should see the visualization of the retargeted robot motion in a mujoco window. 
 - `--rate_limit` is used to limit the rate of the retargeted robot motion to keep the same as the human motion. If you want it as fast as possible, remove `--rate_limit`.
+
+Additional useful BVH flags recently added:
+
+| Flag | Purpose | Notes |
+|------|---------|-------|
+| `--orient_fix {none,x90,x-90,y90,y-90,z180,auto}` | Глобальная ориентация BVH; `auto` подбирает пресет чтобы «спина смотрела вверх». | Применяется до IK; влияет на все кости. |
+| `--offset_to_ground` | Опускает человека так, чтобы минимальная точка ступней оказалась около z=0 (перед retarget). | Удобно убрать «парение» или «провал». |
+| `--show_human_names` | Показать подписи костей человеческого скелета в viewer. | Может снижать FPS. |
+| `--human_offset dx,dy,dz` | Сдвиг (метры) визуализации человека относительно робота. | Только визуализация. |
+| `--show_root_diff` | Показ ∆ позиции корня робота и человеческих Hips. | В оверлее слева. |
+| `--show_quat` | Добавить строку с корневым кватернионом (wxyz) в overlay и видео. | Для отладки ориентации. |
+| `--print_bvh_bones` | Вывести список костей BVH и выйти. | Без ретаргета. |
+| `--dump_first_frame_json path.json` | Сохранить первый кадр после нормализации имён / синтеза суставов. | Для проверки названий / ориентации. |
+| `--no_viewer` | Запуск headless (без окна). | Полезно на macOS без mjpython. |
+
+Внутренние шаги пайплайна BVH:
+1. Чтение BVH → кадры словарей {joint: (pos, quat_wxyz)}
+2. Нормализация имён `_fill_synonyms`
+3. Синтез недостающих костей (например, FootMod / Spine2)
+4. Ориентационный фикс `--orient_fix`
+5. (Опционально) привязка к полу `--offset_to_ground`
+6. Обновление целей IK → решение IK → `qpos`
+7. Визуализация + (опц.) запись видео / сохранение pickle
 
 
 Retarget a folder of motions:
@@ -381,10 +407,32 @@ For a detailed table comparing the early minimal commit (`1b9f50c`) to the curre
 
 
 ## Visualize saved robot motion
+We provide a lightweight viewer for already retargeted pickle motions (`root_pos`, `root_rot`, `dof_pos`).
+
+Saving scripts (`smplx_to_robot.py`, `bvh_to_robot.py`) store root quaternion as **xyzw** (they reorder from internal wxyz). The playback script automatically converts back to wxyz.
+
+Playback (Linux):
 ```bash
-python scripts/vis_robot_motion.py --robot <robot_name> --robot_motion_path <path_to_save_robot_data.pkl>
+python scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1
 ```
-If you want to record video, add `--record_video` and `--video_path <your_video_path,mp4>`.
+Playback (macOS with GUI):
+```bash
+mjpython scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1
+```
+Record video while playing:
+```bash
+mjpython scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1 --video videos/replay.mp4
+```
+
+Ground alignment AFTER saving (если робот «парит»). Быстрая правка pickle:
+```python
+import pickle, numpy as np
+m = pickle.load(open('out/aiming1_g1.pkl','rb'))
+dz = m['root_pos'][:,2].min()   # или m['root_pos'][0,2]
+m['root_pos'][:,2] -= dz
+pickle.dump(m, open('out/aiming1_g1_floor.pkl','wb'))
+```
+или используйте `--offset_to_ground` при ретаргете BVH (предпочтительно).
 
 
 # Speed Benchmark

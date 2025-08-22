@@ -251,6 +251,32 @@ if __name__ == "__main__":
         choices=list(ORIENT_PRESETS.keys()) + ["auto"],
         help="Apply orientation preset (e.g. x-90) or 'auto' to try to stand model upright.",
     )
+    parser.add_argument(
+        "--show_quat",
+        action="store_true",
+        help="Показать и записать в видео строку с корневым кватернионом (wxyz).",
+    )
+    parser.add_argument(
+        "--show_human_names",
+        action="store_true",
+        help="Показать подписи костей человеческого (BVH) скелета.",
+    )
+    parser.add_argument(
+        "--human_offset",
+        type=str,
+        default=None,
+        help="Смещение (dx,dy,dz) для визуализации человеческого скелета, напр. '0,0,0.2'.",
+    )
+    parser.add_argument(
+        "--show_root_diff",
+        action="store_true",
+        help="Отобразить дельту корня: робот - человеческий Hips.",
+    )
+    parser.add_argument(
+        "--offset_to_ground",
+        action="store_true",
+        help="При ретаргете опустить человеческие данные так, чтобы ступни касались земли (использует offset_human_data_to_ground).",
+    )
     
     args = parser.parse_args()
 
@@ -306,6 +332,8 @@ if __name__ == "__main__":
                                                     transparent_robot=0,
                                                     record_video=args.record_video,
                                                     video_path=args.video_path,
+                                                    show_quat=args.show_quat,
+                                                    show_root_diff=args.show_root_diff,
                                                     )
         except RuntimeError as e:
             print(f"[yellow]Viewer disabled due to error: {e}. Continuing headless. (Tip: run with 'mjpython' on macOS to enable viewer.)[/yellow]")
@@ -322,6 +350,18 @@ if __name__ == "__main__":
     
     # Start the viewer
     i = 0
+
+    # Parse human offset once
+    human_offset_vec = np.zeros(3)
+    if args.human_offset:
+        try:
+            parts = [float(x) for x in args.human_offset.split(',')]
+            if len(parts) == 3:
+                human_offset_vec = np.array(parts, dtype=float)
+            else:
+                print("[yellow]--human_offset ожидает 3 числа через запятую, игнорирую[/yellow]")
+        except Exception as e:
+            print(f"[yellow]Не удалось разобрать --human_offset: {e}[/yellow]")
 
     while i < len(lafan1_data_frames):
         
@@ -341,7 +381,7 @@ if __name__ == "__main__":
         smplx_data = lafan1_data_frames[i]
 
         # retarget
-        qpos = retargeter.retarget(smplx_data)
+        qpos = retargeter.retarget(smplx_data, offset_to_ground=args.offset_to_ground)
 
         # visualize
         if robot_motion_viewer is not None:
@@ -350,6 +390,8 @@ if __name__ == "__main__":
                 root_rot=qpos[3:7],
                 dof_pos=qpos[7:],
                 human_motion_data=retargeter.scaled_human_data,
+                show_human_body_name=args.show_human_names,
+                human_pos_offset=human_offset_vec,
                 rate_limit=args.rate_limit,
             )
 
