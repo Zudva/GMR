@@ -8,6 +8,83 @@ from rich import print
 from tqdm import tqdm
 import os
 import numpy as np
+from math import sqrt
+
+# Quaternion helpers (scalar-first w,x,y,z)
+def _quat_mul(q1, q2):
+    w1,x1,y1,z1 = q1
+    w2,x2,y2,z2 = q2
+    return np.array([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2
+    ], dtype=np.float64)
+
+_SQ2 = sqrt(0.5)
+ORIENT_PRESETS = {
+    "none": np.array([1,0,0,0], dtype=np.float64),
+    "x90": np.array([_SQ2, _SQ2,0,0], dtype=np.float64),
+    "x-90": np.array([_SQ2,-_SQ2,0,0], dtype=np.float64),
+    "y90": np.array([_SQ2,0,_SQ2,0], dtype=np.float64),
+    "y-90": np.array([_SQ2,0,-_SQ2,0], dtype=np.float64),
+    "z180": np.array([0,0,0,1], dtype=np.float64),
+}
+
+def _apply_orientation_fix(frames, preset, auto_forward=False):
+    if not frames:
+        return frames
+    original_preset = preset
+    best_z = None  # only meaningful for auto branch
+    if preset == "auto":
+        # Evaluate candidate rotations to maximize upward component of spine vector
+        candidates = ["none","x90","x-90","y90","y-90","z180"]
+        hips_name = next((n for n in ["Hips","CC_Base_Pelvis","CC_Base_Hip","CC_Base_BoneRoot"] if n in frames[0]), None)
+        spine_name = next((n for n in ["Spine1","Spine","CC_Base_Spine01","CC_Base_Waist"] if n in frames[0]), None)
+        best = "none"; best_z = -1e9
+        if hips_name and spine_name:
+            base_vec = frames[0][spine_name][0] - frames[0][hips_name][0]
+            for c in candidates:
+                q = ORIENT_PRESETS[c]
+                R = _quat_to_matrix(q)
+                vz = (R @ base_vec)[2]
+                if vz > best_z:
+                    best_z = vz; best = c
+        preset = best
+        if best_z is not None:
+            print(f"[cyan]Auto orientation picked preset: {preset} (spine z={best_z:.4f})[/cyan]")
+        else:
+            print(f"[yellow]Auto orientation fallback: could not evaluate spine vector, using '{preset}'.[/yellow]")
+    else:
+        # Explicit preset requested
+        print(f"[cyan]Using explicit orientation preset: {preset}[/cyan]")
+    q_fix = ORIENT_PRESETS.get(preset, ORIENT_PRESETS["none"])
+    if preset == "none":
+        return frames
+    R_fix = _quat_to_matrix(q_fix)
+    for f in frames:
+        for k,(p,q) in list(f.items()):
+            p_new = R_fix @ p
+            q_new = _quat_mul(q, q_fix)
+            f[k] = (p_new, q_new)
+    print(f"[cyan]Applied orientation preset {preset} to BVH frames[/cyan]")
+    return frames
+
+def _quat_to_matrix(q):
+    w,x,y,z = q
+    # normalized
+    n = w*w+x*x+y*y+z*z
+    if n == 0:
+        return np.eye(3)
+    s = 2.0/n
+    wx, wy, wz = s*w*x, s*w*y, s*w*z
+    xx, xy, xz = s*x*x, s*x*y, s*x*z
+    yy, yz, zz = s*y*y, s*y*z, s*z*z
+    return np.array([
+        [1-(yy+zz), xy - wz, xz + wy],
+        [xy + wz, 1-(xx+zz), yz - wx],
+        [xz - wy, yz + wx, 1-(xx+yy)]
+    ], dtype=np.float64)
 
 # --- Synonym mapping for generic / ActorCore / CC_Base style BVH names ---
 SYNONYM_MAP = {
@@ -167,6 +244,13 @@ if __name__ == "__main__":
         default=None,
         help="Path to write first processed frame (after synonym & synthesis) as JSON for debugging joint names/orientation.",
     )
+    parser.add_argument(
+        "--orient_fix",
+        type=str,
+        default="none",
+        choices=list(ORIENT_PRESETS.keys()) + ["auto"],
+        help="Apply orientation preset (e.g. x-90) or 'auto' to try to stand model upright.",
+    )
     
     args = parser.parse_args()
 
@@ -192,6 +276,7 @@ if __name__ == "__main__":
     lafan1_data_frames = _fill_synonyms(lafan1_data_frames)
     lafan1_data_frames = _synthesize_foot_mod(lafan1_data_frames)
     lafan1_data_frames = _synthesize_spine2(lafan1_data_frames)
+    lafan1_data_frames = _apply_orientation_fix(lafan1_data_frames, args.orient_fix)
 
     if args.dump_first_frame_json and lafan1_data_frames:
         import json as _json
