@@ -434,6 +434,80 @@ pickle.dump(m, open('out/aiming1_g1_floor.pkl','wb'))
 ```
 или используйте `--offset_to_ground` при ретаргете BVH (предпочтительно).
 
+## Motion file conversion: PKL ↔ PT (Torch)
+
+После ретаргета скрипты сохраняют движение в pickle (`.pkl`) со структурой:
+
+```
+{
+  'fps': int,
+  'root_pos': (T,3) float64,
+  'root_rot': (T,4) float64  # ПОРЯДОК: xyzw (заметка: внутренний IK держит wxyz)
+  'dof_pos': (T,Ndof) float64,
+  'local_body_pos': None или массив,
+  'link_body_list': None или список имён
+}
+```
+
+Для прямой загрузки в PyTorch удобнее `.pt` (нет доп. копий numpy→tensor). Добавлен скрипт `scripts/convert_motion_pkl_to_pt.py`.
+
+Базовые команды:
+```bash
+# PKL -> PT
+python scripts/convert_motion_pkl_to_pt.py --input out/aiming1_g1.pkl --output out/aiming1_g1.pt
+
+# PT -> PKL
+python scripts/convert_motion_pkl_to_pt.py --input out/aiming1_g1.pt --output out/aiming1_g1_back.pkl
+
+# Показать сводку (без сохранения итогового файла)
+python scripts/convert_motion_pkl_to_pt.py --input out/aiming1_g1.pkl --output dummy.pt --summary
+
+# Перезаписать существующий файл
+python scripts/convert_motion_pkl_to_pt.py --input out/aiming1_g1.pkl --output out/aiming1_g1.pt --force
+```
+
+Особенности:
+- Кватернион в сохранённом motion pickle: `xyzw`. Скрипт конвертации НЕ меняет порядок — он сохраняет как есть.
+- Viewer (`vis_robot_motion.py`) сам переставляет в `wxyz` при воспроизведении.
+- Скрипт не меняет dtype (по умолчанию float64) — для тренировки обычно выгодно float32.
+
+### Опциональная оптимизация (float32 для экономии памяти)
+
+```python
+import pickle, torch, numpy as np
+data = pickle.load(open('out/aiming1_g1.pkl','rb'))
+for k in ['root_pos','root_rot','dof_pos']:
+    data[k] = data[k].astype(np.float32)
+torch.save({k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v for k,v in data.items()},
+           'out/aiming1_g1_f32.pt')
+```
+
+### Проверка нормализации кватернионов
+```python
+import pickle, numpy as np
+q = pickle.load(open('out/aiming1_g1.pkl','rb'))['root_rot']  # xyzw
+err = np.abs(np.linalg.norm(q, axis=1) - 1).max()
+print('max |norm-1| =', err)
+```
+Если `err < 1e-6` — всё хорошо.
+
+### Быстрая пакетная конверсия каталога PKL → PT
+```bash
+for f in out/*.pkl; do \
+  python scripts/convert_motion_pkl_to_pt.py --input "$f" --output "${f%.pkl}.pt" --force; \
+done
+```
+
+### Зачем переходить на .pt
+| Плюс | Описание |
+|------|----------|
+| Быстрая загрузка | `torch.load` сразу создаёт тензоры на CPU. |
+| Меньше копий | Нет промежуточного numpy→tensor в тренировочном коде. |
+| Легко оптимизировать | Можно заранее перевести в float32 / half / quant. |
+| Интеграция с DataLoader | Можно memory pinning / async transfer.
+
+Если понадобится: можно добавить опцию `--float32` в сам скрипт — откройте issue / PR.
+
 
 # Speed Benchmark
 
