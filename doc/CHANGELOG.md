@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on Keep a Changelog, and this project (currently) does not yet follow semantic versioning strictly.
 
 ## [Unreleased]
+- Added BVH flag `--offset_to_ground` (pre-IK floor alignment via foot min-z).
+- New lightweight playback script `scripts/vis_robot_motion.py` (supports `.pkl` & `.pt`).
+- Playback enhancements: quaternion xyzw→wxyz auto-fix, `--no_rate_limit` (fast mode), `--summary` (print shapes/dtypes), headless validation mode (`--headless`).
+- Motion conversion script `scripts/convert_motion_pkl_to_pt.py` (PKL ↔ PT, force overwrite, summary).
+- README updates: clarified saved quaternion ordering, .pt usage, ground alignment options.
 - Future: per-joint orientation error logging, acceleration overlay, latency stats, unit tests for parsers.
 
 ## [0.2.0] - 2025-08-22

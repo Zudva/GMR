@@ -407,22 +407,48 @@ For a detailed table comparing the early minimal commit (`1b9f50c`) to the curre
 
 
 ## Visualize saved robot motion
-We provide a lightweight viewer for already retargeted pickle motions (`root_pos`, `root_rot`, `dof_pos`).
+We provide a lightweight viewer `scripts/vis_robot_motion.py` for already retargeted motions (`root_pos`, `root_rot`, `dof_pos`). It now supports both pickle (`.pkl`) and Torch (`.pt`) motion files.
 
-Saving scripts (`smplx_to_robot.py`, `bvh_to_robot.py`) store root quaternion as **xyzw** (they reorder from internal wxyz). The playback script automatically converts back to wxyz.
+Quaternion convention reminder:
+- Internal pipeline (IK / viewer input) uses `wxyz`.
+- Saved motion files (`.pkl` / `.pt`) store `root_rot` as `xyzw` (legacy decision to align with some datasets).
+- The viewer automatically reorders to `wxyz` and renormalizes; you do NOT need to preprocess.
 
-Playback (Linux):
+Quick playback examples:
 ```bash
+# Linux (any .pkl or .pt)
 python scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1
-```
-Playback (macOS with GUI):
-```bash
+python scripts/vis_robot_motion.py --motion out/aiming1_g1.pt  --robot unitree_g1
+
+# macOS (GUI requires mjpython)
 mjpython scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1
+mjpython scripts/vis_robot_motion.py --motion out/aiming1_g1.pt  --robot unitree_g1
 ```
-Record video while playing:
+
+Fast mode (disable real-time pacing):
+```bash
+mjpython scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1 --no_rate_limit
+```
+
+Headless validation (shape + quaternion norm check, no GUI):
+```bash
+python scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1 --headless --summary
+```
+
+Record video while playing (.pkl or .pt):
 ```bash
 mjpython scripts/vis_robot_motion.py --motion out/aiming1_g1.pkl --robot unitree_g1 --video videos/replay.mp4
 ```
+
+Viewer flags summary:
+| Flag | Purpose |
+|------|---------|
+| `--motion PATH` | Input motion file (`.pkl` or `.pt`). |
+| `--robot NAME` | Robot key (e.g. `unitree_g1`). |
+| `--video path.mp4` | Record playback to MP4. |
+| `--no_rate_limit` | Run frames as fast as possible (no sleep). |
+| `--headless` | Skip GUI; validate data & print result. |
+| `--summary` | Print tensor shapes / dtypes before playback. |
 
 Ground alignment AFTER saving (если робот «парит»). Быстрая правка pickle:
 ```python
@@ -432,7 +458,7 @@ dz = m['root_pos'][:,2].min()   # или m['root_pos'][0,2]
 m['root_pos'][:,2] -= dz
 pickle.dump(m, open('out/aiming1_g1_floor.pkl','wb'))
 ```
-или используйте `--offset_to_ground` при ретаргете BVH (предпочтительно).
+или (предпочтительно) используйте `--offset_to_ground` при ретаргете BVH, чтобы сохранить корректную посадку сразу в сохранённом файле.
 
 ## Motion file conversion: PKL ↔ PT (Torch)
 
