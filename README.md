@@ -207,6 +207,83 @@ Additional useful BVH flags recently added:
 6. Обновление целей IK → решение IK → `qpos`
 7. Визуализация + (опц.) запись видео / сохранение pickle
 
+### Canonicalization / Нормализация BVH перед ретаргетом
+
+Для нестандартных BVH (например, OptiTrack / ActorCore экспорт с переводами у всех костей, множеством `Twist` / `ShareBone` узлов и «лежащей» ориентацией) добавлен скрипт `scripts/fix_bvh_root_only.py`, который выполняет:
+
+Функции:
+- Переводит весь скелет в формат «только корень имеет трансляцию» (root: 6 каналов, остальные: 3 вращения).
+- Фиксирует статические `OFFSET` для всех не‑root костей (статистика: median / mean / first).
+- Глобальный поворот для «установки» персонажа вертикально (`--upright {none,x90,x-90,y90,y-90,z180,auto}`; `auto` выбирает пресет максимизирующий ось Z у вектора Spine).
+- Выравнивание по полу (`--floor_align`): сдвиг корня так, чтобы минимальная Z среди стоп/носков стала 0.
+- Простейшее «прореживание» (prune) сверхмелких / вспомогательных костей по порогу нормы смещения (`--prune_min_offset`).
+
+Быстрый пример (полный набор):
+```bash
+python scripts/fix_bvh_root_only.py \
+  --input data/optitrack/test.bvh \
+  --output out/test_canonical_upright.bvh \
+  --upright auto --floor_align --offset_stat median
+```
+
+С обрезкой мелких костей (например, удаляем те, у кого статический offset < 1 мм):
+```bash
+python scripts/fix_bvh_root_only.py \
+  --input data/optitrack/test.bvh \
+  --output out/test_canonical_pruned.bvh \
+  --upright auto --floor_align \
+  --prune_min_offset 0.001
+```
+
+Затем можно ретаргетить уже канонический файл:
+```bash
+python scripts/bvh_to_robot.py --bvh_file out/test_canonical_pruned.bvh --robot unitree_g1 --rate_limit
+```
+
+Ключевые параметры:
+| Флаг | Назначение | Когда использовать |
+|------|------------|--------------------|
+| `--upright auto|preset` | Применяет глобальный кватернион ко ВСЕМ суставам (FK→Rotate→IK) | Модель «лежит» или повернута, автоматический выбор по оси Spine |
+| `--floor_align` | Сдвигает корень по Z, чтобы стопы касались пола | Если изначально персонаж «парит» или утоплен |
+| `--offset_stat median|mean|first` | Как вычислить статические OFFSET | `median` устойчив к шуму; `first` если нужно сохранить исходный первый кадр |
+| `--prune_min_offset T` | Удаляет кости с norm(OFFSET) < T (кроме сохранённых) | Убрать нулевые Twist/ShareBone для ускорения IK |
+| `--prune_keep list` | Список костей которые нельзя удалять (через запятую) | Гарантированно сохраняет каркас для IK |
+| `--out_order zyx|xyz|...` | Порядок Эйлеровых углов при записи | Согласование с downstream tooling |
+
+Рекомендованный workflow для «сырых» BVH:
+1. Запустить canonicalizer с `--upright auto --floor_align` → проверить что корень адекватно стоит.
+2. При необходимости поднять/понизить порог prune (0.0 → 0.001 → 0.003) и сверить число суставов (логи выводят «pruned N joints»).
+3. Ретаргетить канонический файл (`bvh_to_robot.py`).
+4. Если всё корректно – сохранить пороги в свой скрипт/Makefile.
+
+Диагностика преимуществ (пример из `data/optitrack/test.bvh`):
+- Исходный файл: 101 joint, у многих костей микроскопические длины / почти нулевые динамические трансляции.
+- После canonicalization: стабильные OFFSET, отсутствует шум локальных переводов, корень выставлен на уровень пола.
+- После prune (`--prune_min_offset 0.001`): 87 joint (‑14 вспомогательных), меньше вычислений в IK / viewer.
+
+Когда НЕ стоит применять prune: если downstream внешний инструмент жёстко ожидает полную иерархию (например, экспорт обратно в DCC), или если twist кости нужны для точной ориентации рук в другой задаче. В остальных случаях prune безопасно.
+
+Fail-safe: всегда держите оригинал рядом (например `original.bvh`), чтобы можно было подобрать другой порог без потери данных.
+
+Сравнение команд перед ретаргетом:
+```bash
+# (A) Прямо ретаргетить исходный BVH (риск: лежащий, «парящий», лишние кости)
+python scripts/bvh_to_robot.py --bvh_file data/optitrack/test.bvh --robot unitree_g1
+
+# (B) Рекомендуемый путь
+python scripts/fix_bvh_root_only.py \
+  --input data/optitrack/test.bvh \
+  --output out/test_clean.bvh \
+  --upright auto --floor_align --prune_min_offset 0.001
+python scripts/bvh_to_robot.py --bvh_file out/test_clean.bvh --robot unitree_g1 --rate_limit
+```
+
+Если авто‑ориентирование (`--upright auto`) всегда даёт `none`, попробуйте жёсткие пресеты (`x90`, `x-90`, `y90`, ...) и визуально оцените.
+
+Планируемые расширения (можно открыть issue): автоматическая оценка оптимального порога prune по цели «<= X% удалено», сохранение отчёта (JSON) о статистике bone length вариаций, batch canonicalization директории.
+
+---
+
 
 Retarget a folder of motions:
 ```bash

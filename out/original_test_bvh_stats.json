@@ -1,0 +1,8 @@
+{
+  "frames": 250,
+  "joints": 101,
+  "mean_non_root_translation_std": 1.0618142209776213e-05,
+  "fraction_dynamic_non_root": 0.0,
+  "median_relative_bone_length_std": 2.553502264675927e-16,
+  "max_relative_bone_length_std": 0.16800935616624366
+}

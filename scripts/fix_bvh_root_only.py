@@ -44,6 +44,8 @@ def parse_args():
     ap.add_argument('--upright', default='none', choices=list(ORIENT_PRESETS.keys())+['auto'])
     ap.add_argument('--floor_align', action='store_true', help='Shift root so min foot/toe global z=0 after upright')
     ap.add_argument('--verbose', action='store_true')
+    ap.add_argument('--prune_min_offset', type=float, default=0.0, help='Prune non-root joints whose static offset norm < threshold.')
+    ap.add_argument('--prune_keep', type=str, default='Hips,Spine,Spine1,Spine2,LeftUpLeg,RightUpLeg,LeftLeg,RightLeg,LeftFoot,RightFoot,LeftToeBase,RightToeBase', help='Comma-separated joint names to always keep when pruning.')
     return ap.parse_args()
 
 def _quat_mul(q1, q2):
@@ -192,41 +194,127 @@ def main():
     order = args.out_order.lower()
     eulers = np.degrees(_quats_to_eulers(lquats, order))  # (F,J,3)
 
+    # Optional pruning (after computing static offsets & eulers, before serialization)
+    pruned_mapping = None
+    if args.prune_min_offset > 0.0:
+        keep_names = set([n.strip() for n in args.prune_keep.split(',') if n.strip()])
+        offset_norms = np.linalg.norm(offsets, axis=1)
+        keep_mask = np.ones(J, dtype=bool)
+        keep_mask[0] = True  # always root
+        for j in range(1, J):
+            name = anim.bones[j]
+            if name in keep_names:
+                continue
+            if offset_norms[j] < args.prune_min_offset:
+                keep_mask[j] = False
+        # Ensure a parent kept if any child kept (handled later by reparent climb)
+        new_indices = {old_i: new_i for new_i, old_i in enumerate([i for i in range(J) if keep_mask[i]])}
+        # Rebuild parents
+        new_parents = []
+        new_names = []
+        new_offsets = []
+        new_eulers = []
+        root_translation = lpos[:,0].copy()
+        for old_i in range(J):
+            if not keep_mask[old_i]:
+                continue
+            # climb to nearest kept parent
+            p = anim.parents[old_i]
+            while p >=0 and not keep_mask[p]:
+                p = anim.parents[p]
+            new_parents.append(new_indices[p] if p>=0 else -1)
+            new_names.append(anim.bones[old_i])
+            new_offsets.append(offsets[old_i])
+            new_eulers.append(eulers[:,old_i])
+        new_offsets = np.stack(new_offsets, axis=0)
+        new_eulers = np.stack(new_eulers, axis=1)  # (F,newJ,3)
+        if args.verbose:
+            removed = [anim.bones[i] for i in range(J) if not keep_mask[i]]
+            print(f'[info] pruned {len(removed)} joints (<{args.prune_min_offset} offset norm): {removed[:15]}{"..." if len(removed)>15 else ""}')
+        # Replace structures
+        pruned_mapping = new_indices
+        offsets = new_offsets
+        eulers = new_eulers
+        anim_bones = new_names
+        parents_new = new_parents
+        J_new = len(new_names)
+    else:
+        anim_bones = anim.bones
+        parents_new = anim.parents.tolist()
+        J_new = J
+
     # Header rewrite
-    header_lines = load_header_lines(src)
-    joint_idx=-1
     rot_tokens = ' '.join(ROT_TOKEN_MAP[c] for c in order)
-    rewritten=[]
-    for line in header_lines:
-        if re.match(r'ROOT\s+\w+', line) or re.match(r'\s*JOINT\s+\w+', line):
-            joint_idx+=1; rewritten.append(line); continue
-        if 'CHANNELS' in line:
-            if joint_idx==0:
-                newline = re.sub(r'CHANNELS\s+\d+.*', f'CHANNELS 6 Xposition Yposition Zposition {rot_tokens}', line)
+    if pruned_mapping is None:
+        # fast path reuse modified original header
+        header_lines = load_header_lines(src)
+        joint_idx=-1
+        rewritten=[]
+        for line in header_lines:
+            if re.match(r'ROOT\s+\w+', line) or re.match(r'\s*JOINT\s+\w+', line):
+                joint_idx+=1; rewritten.append(line); continue
+            if 'CHANNELS' in line:
+                if joint_idx==0:
+                    newline = re.sub(r'CHANNELS\s+\d+.*', f'CHANNELS 6 Xposition Yposition Zposition {rot_tokens}', line)
+                else:
+                    newline = re.sub(r'CHANNELS\s+\d+.*', f'CHANNELS 3 {rot_tokens}', line)
+                rewritten.append(newline); continue
+            if 'OFFSET' in line and joint_idx>=0:
+                off = offsets[joint_idx]
+                newline = re.sub(r'OFFSET\s+.*', f'OFFSET {off[0]:.6f} {off[1]:.6f} {off[2]:.6f}', line)
+                rewritten.append(newline); continue
+            rewritten.append(line)
+    else:
+        # build new minimal header from pruned skeleton
+        children = {i: [] for i in range(J_new)}
+        for i,p in enumerate(parents_new):
+            if p>=0: children[p].append(i)
+        rewritten=['HIERARCHY']
+        def emit(idx, indent=0, is_root=False):
+            name = anim_bones[idx]
+            ind='\t'*indent
+            if is_root:
+                rewritten.append(f'ROOT {name}')
             else:
-                newline = re.sub(r'CHANNELS\s+\d+.*', f'CHANNELS 3 {rot_tokens}', line)
-            rewritten.append(newline); continue
-        if 'OFFSET' in line and joint_idx>=0:
-            off = offsets[joint_idx]
-            newline = re.sub(r'OFFSET\s+.*', f'OFFSET {off[0]:.6f} {off[1]:.6f} {off[2]:.6f}', line)
-            rewritten.append(newline); continue
-        rewritten.append(line)
+                rewritten.append(f'{ind}JOINT {name}')
+            rewritten.append(f'{ind}{{')
+            off = offsets[idx]
+            rewritten.append(f'{ind}\tOFFSET {off[0]:.6f} {off[1]:.6f} {off[2]:.6f}')
+            if is_root:
+                rewritten.append(f'{ind}\tCHANNELS 6 Xposition Yposition Zposition {rot_tokens}')
+            else:
+                rewritten.append(f'{ind}\tCHANNELS 3 {rot_tokens}')
+            for ch in children[idx]:
+                emit(ch, indent+1, False)
+            # simple End Site placeholder
+            rewritten.append(f'{ind}\tEnd Site')
+            rewritten.append(f'{ind}\t{{')
+            rewritten.append(f'{ind}\t\tOFFSET 0.000000 0.000000 0.000000')
+            rewritten.append(f'{ind}\t}}')
+            rewritten.append(f'{ind}}}')
+        root_index = next(i for i,p in enumerate(parents_new) if p==-1)
+        emit(root_index, 0, True)
 
     prec = args.precision
     out_lines = rewritten + ['MOTION', f'Frames: {F}', f'Frame Time: {args.frame_time:.7f}']
-    for f in range(F):
+    # Determine which root pos array to use (if pruned still original root index = maybe moved but we kept root translation array lpos)
+    for fidx in range(F):
         row=[]
-        root_pos = lpos[f,0]
+        # Root translation always first joint in our ordering as constructed
+        root_pos = lpos[fidx,0]
         row.extend([f'{root_pos[0]:.{prec}f}', f'{root_pos[1]:.{prec}f}', f'{root_pos[2]:.{prec}f}'])
-        row.extend([f'{eulers[f,0,0]:.{prec}f}', f'{eulers[f,0,1]:.{prec}f}', f'{eulers[f,0,2]:.{prec}f}'])
-        for j in range(1,J):
-            row.extend([f'{eulers[f,j,0]:.{prec}f}', f'{eulers[f,j,1]:.{prec}f}', f'{eulers[f,j,2]:.{prec}f}'])
+        row.extend([f'{eulers[fidx,0,0]:.{prec}f}', f'{eulers[fidx,0,1]:.{prec}f}', f'{eulers[fidx,0,2]:.{prec}f}'])
+        for j in range(1, J_new):
+            row.extend([f'{eulers[fidx,j,0]:.{prec}f}', f'{eulers[fidx,j,1]:.{prec}f}', f'{eulers[fidx,j,2]:.{prec}f}'])
         out_lines.append(' '.join(row))
 
     dst = Path(args.output)
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text('\n'.join(out_lines))
-    print(f'[info] wrote canonical BVH {dst} (frames={F}, joints={J}, order={order})')
+    if pruned_mapping is None:
+        print(f'[info] wrote canonical BVH {dst} (frames={F}, joints={J_new}, order={order})')
+    else:
+        print(f'[info] wrote canonical BVH {dst} (frames={F}, joints_pruned={J_new} / orig={J}, order={order})')
 
 if __name__ == '__main__':
     main()
