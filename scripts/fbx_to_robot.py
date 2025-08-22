@@ -642,6 +642,8 @@ def parse_args(argv=None):
     p.add_argument("--suggest_offsets", type=float, default=None, help="Analyze first frame and suggest pos_offset (global approx) for bodies with |delta| > threshold (meters). Provide threshold value, e.g. 0.15")
     p.add_argument("--apply_suggested_offsets", action="store_true", help="Immediately apply suggested offsets to runtime (not modifying JSON file) after computing them")
     p.add_argument("--quick_orient_scan", action="store_true", help="Try a small set of orientation presets (identity,x90,x-90,y90,y-90,z180) and pick the one that makes (Spine1-hips) point most upward (Z>0). Applied before other orientation logic if --orient_fix is none.")
+    p.add_argument("--dump_first_frame_json", type=str, default=None, help="Write JSON of first-frame joint pos/quat after orientation (debug mapping, e.g. left arm)")
+    p.add_argument("--dump_targets_csv", type=str, default=None, help="Write CSV of per-frame key target positions (hips/hands/toes) for analysis")
     return p.parse_args(argv)
 
 def main(argv=None):
@@ -774,6 +776,16 @@ def main(argv=None):
                 print('[cyan]quick_orient_scan kept identity orientation (already upright or insufficient data).')
         else:
             print('[yellow]quick_orient_scan: missing Hips or Spine1/Spine/Chest/Head, skipping scan.')
+    if args.dump_first_frame_json:
+        try:
+            import json
+            fr0 = frames[0]
+            dump = {k:{'pos':v[0].tolist(),'quat_wxyz':v[1].tolist()} for k,v in fr0.items()}
+            with open(args.dump_first_frame_json,'w') as f:
+                json.dump(dump,f,indent=2)
+            print(f"[green]dump_first_frame_json written: {args.dump_first_frame_json} (joints={len(fr0)})[/green]")
+        except Exception as e:
+            print(f"[red]Failed dump_first_frame_json: {e}")
     # Auto orientation (post-load rotation). Rotate about initial hips pivot to avoid large translational drift.
     if args.orient_fix == 'auto':
         def _get(name, fr):
@@ -1206,9 +1218,33 @@ def main(argv=None):
             rate_limit=args.rate_limit,
             follow_camera=True,
         )
+        if args.dump_targets_csv:
+            # Lazy open file first time
+            if '._targets_csv_f' not in globals():
+                pass
+        
     viewer.close()
     if csv_writer:
         csv_writer.close()
+    if args.dump_targets_csv:
+        # Re-run quick pass to write CSV (avoid opening/closing per frame above)
+        try:
+            import csv
+            with open(args.dump_targets_csv,'w',newline='') as fcsv:
+                w=csv.writer(fcsv)
+                w.writerow(["frame","hips_x","hips_y","hips_z","lhand_x","lhand_y","lhand_z","rhand_x","rhand_y","rhand_z","ltoe_x","ltoe_y","ltoe_z","rtoe_x","rtoe_y","rtoe_z"])
+                for idx, fr in enumerate(frames):
+                    # scaled_human_data is overwritten each retarget; recompute
+                    retargeter.retarget(fr)
+                    H = getattr(retargeter,'scaled_human_data',fr)
+                    def _p(name):
+                        return H.get(name, [np.full(3,np.nan),None])[0]
+                    hips=_p('Hips'); lh=_p('LeftHand'); rh=_p('RightHand'); lt=_p('LeftToeBase'); rt=_p('RightToeBase')
+                    row=[idx,*hips.tolist(),*lh.tolist(),*rh.tolist(),*lt.tolist(),*rt.tolist()]
+                    w.writerow(row)
+            print(f"[green]dump_targets_csv written: {args.dump_targets_csv}")
+        except Exception as e:
+            print(f"[red]Failed writing dump_targets_csv: {e}")
 
 if __name__ == "__main__":  # pragma: no cover
     main()

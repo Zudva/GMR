@@ -1,4 +1,5 @@
 # GMR: General Motion Retargeting
+# GMR: General Motion Retargeting
 
 
   <a href="https://arxiv.org/abs/2505.02833">
@@ -329,6 +330,54 @@ Minimal difference summary:
 - BVH path skips conversion; we rely on `--quick_orient_scan` to choose an upright preset because we disabled other orientation logic (`--orient_fix none`).
 - FBX path performs Blender conversion (if needed), full auto orientation (`--orient_fix auto`), normalization, then restores raw root trajectory (`--use_root_motion`).
 - Normalization may change vertical placement; if the avatar sinks, adjust offsets later instead of removing orientation correction.
+
+### Extended Diagnostics & Mapping Debug (Added After Original Release)
+
+New helper flags for deeper inspection of FBX/BVH alignment and IK quality:
+```bash
+--dump_first_frame_json first_frame_debug.json   # JSON: all joints (pos meters, quat wxyz) after orientation, before IK loop
+--dump_targets_csv targets.csv                  # CSV: per-frame key target positions (hips, hands, toes)
+--debug_initial_targets                         # Prints robot-vs-human deltas for pelvis/hands/toes before loop
+--debug_pelvis_anchor                           # Every 30 frames: distances pelvis→(Hips, LeftUpLeg, RightUpLeg)
+--suggest_offsets <thr> [--apply_suggested_offsets]
+--auto_pelvis_offset xyz                        # Auto inject pelvis pos_offset along chosen axes
+```
+
+Example (stable orientation known = `x-90`) with full logging & dumps:
+```bash
+mjpython scripts/fbx_to_robot.py \
+  --fbx_file /path/to/your_motion.fbx \
+  --robot unitree_g1 \
+  --always_overwrite \
+  --orient_fix x-90 \
+  --log_errors --errors_csv errors.csv \
+  --dump_first_frame_json first_frame_debug.json \
+  --dump_targets_csv targets.csv
+```
+
+### Differences vs. Original Video Demo Pipeline
+
+The initial repository video showed a minimal retarget path. The current extended pipeline adds layers primarily for robustness & diagnosis. Key differences:
+
+| Aspect | Original Demo (Video) | Extended Pipeline (Now) | Benefit |
+|--------|-----------------------|-------------------------|---------|
+| Orientation handling | Manual preset / implicit | `--orient_fix auto` + `--quick_orient_scan` | Automatic upright detection, fewer “lying” avatars |
+| Axis fix | Fixed Y-up→Z-up | Selectable (`--ubisoft_axes`, `--no_axis_fix`) | Easier experimentation with unusual exports |
+| Root normalization | None / implicit origin | `--normalize_root` + `--use_root_motion` | Clean floor contact + preserved global trajectory |
+| Pelvis drift control | Default weights | `--pelvis_pos_w1/2`, `--auto_pelvis_offset` | Stabilized base alignment, remove constant bias |
+| Morphology offsets | Static JSON only | `--suggest_offsets` + optional apply | Rapid coarse tuning without editing JSON each run |
+| Orientation quick preset test | Manual trial & error | `--quick_orient_scan` | Single run finds best of {id, x±90, y±90, z180} |
+| Per-frame diagnostics | Basic console output | `--log_errors`, `--errors_csv`, `--task_error_breakdown` | Quantitative tracking / regression checks |
+| Joint mapping sanity | None | `--dump_first_frame_json`, `--debug_initial_targets` | Fast detection of mis-mapped limbs (e.g., left arm) |
+| Trajectory export | Not exposed | `--traj_csv`, `--dump_targets_csv` | Offline plotting / analytics |
+| Pelvis anchor insight | None | `--debug_pelvis_anchor` | Understand which human joint pelvis follows |
+| Camera control | Default distance | `--camera_dist` | Consistent framing for comparisons |
+
+Practical effect: you can start with a legacy quick view, then progressively enable only the diagnostics you need (JSON or CSV dumps, offset suggestions) without permanently altering the IK config. This reduces iteration time when resolving issues like a single limb misalignment (e.g., left arm) or constant pelvis bias.
+
+### Legacy Comparison
+
+For a detailed table comparing the early minimal commit (`1b9f50c`) to the current feature-rich pipeline (orientation scan, root normalization/restoration, diagnostics, FBX path, offset heuristics, dumps, viewer upgrades), see: [doc/LEGACY_DIFF.md](doc/LEGACY_DIFF.md).
 
 
 ## Visualize saved robot motion
