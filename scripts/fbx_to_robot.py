@@ -641,6 +641,7 @@ def parse_args(argv=None):
     p.add_argument("--camera_dist", type=float, default=None, help="Override viewer camera distance (further away if value > default)")
     p.add_argument("--suggest_offsets", type=float, default=None, help="Analyze first frame and suggest pos_offset (global approx) for bodies with |delta| > threshold (meters). Provide threshold value, e.g. 0.15")
     p.add_argument("--apply_suggested_offsets", action="store_true", help="Immediately apply suggested offsets to runtime (not modifying JSON file) after computing them")
+    p.add_argument("--quick_orient_scan", action="store_true", help="Try a small set of orientation presets (identity,x90,x-90,y90,y-90,z180) and pick the one that makes (Spine1-hips) point most upward (Z>0). Applied before other orientation logic if --orient_fix is none.")
     return p.parse_args(argv)
 
 def main(argv=None):
@@ -728,6 +729,51 @@ def main(argv=None):
     # (Normalization moved after auto orientation below)
 
     original_hips_traj = None  # will hold original (pre-normalization) hips positions per frame for root motion
+    # Quick scan for an upright orientation if requested (only if user did not specify a non-auto preset)
+    if args.quick_orient_scan and args.orient_fix == 'none':
+        # Candidate quaternions (scalar-first) similar to orient_map earlier
+        candidates = {
+            'id': np.array([1,0,0,0]),
+            'x90': R.from_euler('x',90, degrees=True).as_quat(scalar_first=True),
+            'x-90': R.from_euler('x',-90, degrees=True).as_quat(scalar_first=True),
+            'y90': R.from_euler('y',90, degrees=True).as_quat(scalar_first=True),
+            'y-90': R.from_euler('y',-90, degrees=True).as_quat(scalar_first=True),
+            'z180': R.from_euler('z',180, degrees=True).as_quat(scalar_first=True),
+        }
+        ref = frames[0]
+        hip_name = 'Hips' if 'Hips' in ref else None
+        spine_name = None
+        for cand in ['Spine1','Spine','Chest','Head']:
+            if cand in ref:
+                spine_name = cand; break
+        if hip_name and spine_name:
+            hip_pivot = ref[hip_name][0].copy()
+            best = None
+            for label, qc in candidates.items():
+                Rcorr = R.from_quat([qc[1],qc[2],qc[3],qc[0]]).as_matrix()  # convert scalar-first to rotation matrix via x,y,z,w reorder
+                up_vec = (ref[spine_name][0] - hip_pivot) @ Rcorr.T  # rotate vector
+                score = up_vec[2]  # want positive Z
+                # mild penalty if |x| or |y| dominates (prefer mostly vertical)
+                horiz = np.linalg.norm(up_vec[:2])
+                if horiz > 1e-6:
+                    score -= 0.1 * horiz
+                if best is None or score > best[0]:
+                    best = (score, label, qc)
+            if best is not None and best[1] != 'id':
+                ORIENT_FIX_QUAT = best[2]
+                print(f"[cyan]quick_orient_scan selected preset {best[1]} (score={best[0]:.3f}); applying rotation about hips pivot")
+                # Apply rotation about hip pivot
+                Rcorr = R.from_quat([ORIENT_FIX_QUAT[1],ORIENT_FIX_QUAT[2],ORIENT_FIX_QUAT[3],ORIENT_FIX_QUAT[0]]).as_matrix()
+                qcorr = ORIENT_FIX_QUAT
+                for fr in frames:
+                    for k,(p,q) in fr.items():
+                        p2 = (p - hip_pivot) @ Rcorr.T + hip_pivot
+                        q2 = _lafan_utils.quat_mul(q, qcorr)
+                        fr[k] = (p2, q2)
+            else:
+                print('[cyan]quick_orient_scan kept identity orientation (already upright or insufficient data).')
+        else:
+            print('[yellow]quick_orient_scan: missing Hips or Spine1/Spine/Chest/Head, skipping scan.')
     # Auto orientation (post-load rotation). Rotate about initial hips pivot to avoid large translational drift.
     if args.orient_fix == 'auto':
         def _get(name, fr):

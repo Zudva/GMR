@@ -257,6 +257,79 @@ Troubleshooting tips:
 - Parser reshape/channel errors: add `--force_generic_loader` (automatic loose fallback also triggers when strict parsing fails).
 - Almost zero motion variance warning: verify animation baked correctly in Blender; ensure correct armature selected.
 
+### Minimal BVH / FBX Quick Start (New Quick Orientation Scan)
+
+If you already have a BVH (or converted FBX externally) and just want a quick visualization without complex auto-orientation logic:
+
+```bash
+mjpython scripts/fbx_to_robot.py \
+  --bvh_file data/optitrack/test.bvh \
+  --robot unitree_g1 \
+  --orient_fix none \
+  --quick_orient_scan
+```
+
+`--quick_orient_scan` tries a tiny set of global rotations (identity, x±90, y±90, z180) around the hips and picks the one making the spine point most upward (preventing the character from lying face‑down). Use it only when you pass `--orient_fix none`.
+
+#### Flag Behavior Clarification
+
+| Flag | What it Does | When to Use | Side Effects |
+|------|---------------|-------------|--------------|
+| `--normalize_root` | Shifts initial hips to origin and raises / lowers so feet sit on z=0 | For datasets with arbitrary world offsets / ground penetration | Can make model appear “sunk” if ground estimate off; combine with `--use_root_motion` to restore trajectory |
+| `--use_root_motion` | Reapplies original pre-normalization hips XY(Z) trajectory to base after IK | When you want preserved global translation/heading | If normalization floor estimate was low, legs may clip until offsets tuned |
+| `--pelvis_pos_w1/2` | Increases pelvis position weight in IK stage1/stage2 | If pelvis drifts or root motion isn’t followed | Too large: may force unnatural leg pose (stiff/feet sliding) |
+| `--suggest_offsets <thr>` | Compares first-frame human vs robot target per body, suggests position offsets where |delta| > threshold (m) | Rapid coarse alignment when skeleton origins differ | Uses only first frame (heuristic); can overfit if starting pose atypical |
+| `--apply_suggested_offsets` | Immediately applies those suggested offsets at runtime (does NOT write JSON) | Fast iteration while tuning | May distort limbs (e.g. crossed legs) if suggestions include lateral leg swaps |
+
+If `--suggest_offsets` produced crossed legs, lower the threshold (e.g. 0.25→0.15→0.10) or skip applying and instead manually edit only safe torso/arm offsets in `general_motion_retargeting/ik_configs/fbx_to_g1.json`.
+
+Recommended progressive workflow:
+1. Start: quick orientation scan (command above).
+2. If upright: add `--normalize_root --use_root_motion`. Check for sinking; if sunk only to waist, ground estimate may be low—consider later adding a custom pelvis Z offset flag (coming soon) or adjusting floor detection.
+3. Increase pelvis weights only if root jitters or floats (`--pelvis_pos_w1 20 --pelvis_pos_w2 40`). If no visible improvement, keep defaults.
+4. Run `--suggest_offsets 0.15` WITHOUT `--apply_suggested_offsets` first to inspect console deltas; selectively copy good torso/shoulder values into config.
+5. Re-run without suggestions and verify symmetry (avoid leg crossing). Then optionally fine-tune smaller threshold.
+
+Persisting offsets: once satisfied, edit the JSON file (e.g. `fbx_to_g1.json`) and place chosen vectors into `stage1.pos_offset` / `stage2.pos_offset` entries so you no longer need runtime suggestion flags.
+
+### Quick Reference: Two Canonical Commands (BVH vs FBX)
+
+Below are two "рабочие" (tested working) baseline commands you can copy-paste depending on whether you start from BVH or directly from an FBX file.
+
+BVH (already have BVH, just orient & view):
+```bash
+mjpython scripts/fbx_to_robot.py \
+  --bvh_file data/optitrack/test.bvh \
+  --robot unitree_g1 \
+  --orient_fix none \
+  --quick_orient_scan
+```
+Add these if you also want root normalization + original translation restored:
+```bash
+  --normalize_root --use_root_motion
+```
+
+FBX (convert FBX -> BVH + full pipeline with auto orientation & root motion):
+```bash
+mjpython scripts/fbx_to_robot.py \
+  --fbx_file /path/to/your_motion.fbx \
+  --robot unitree_g1 \
+  --always_overwrite \
+  --orient_fix auto --auto_forward_axis x \
+  --normalize_root --use_root_motion \
+  --log_errors --errors_csv errors.csv
+```
+Optional tuning flags (use only if needed):
+```bash
+  --pelvis_pos_w1 30 --pelvis_pos_w2 50            # strengthen pelvis tracking
+  --suggest_offsets 0.15 --apply_suggested_offsets  # heuristic first-frame offsets (inspect before applying)
+  --camera_dist 5                                   # move camera back
+```
+Minimal difference summary:
+- BVH path skips conversion; we rely on `--quick_orient_scan` to choose an upright preset because we disabled other orientation logic (`--orient_fix none`).
+- FBX path performs Blender conversion (if needed), full auto orientation (`--orient_fix auto`), normalization, then restores raw root trajectory (`--use_root_motion`).
+- Normalization may change vertical placement; if the avatar sinks, adjust offsets later instead of removing orientation correction.
+
 
 ## Visualize saved robot motion
 ```bash
