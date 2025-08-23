@@ -239,6 +239,11 @@ if __name__ == "__main__":
         help="Run headless (no MuJoCo viewer). Useful for generating motion file on macOS without mjpython.",
     )
     parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Skip viewer (generate motion only). Overrides --no_viewer if both given.",
+    )
+    parser.add_argument(
         "--dump_first_frame_json",
         type=str,
         default=None,
@@ -279,6 +284,9 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+
+    # Resolve headless mode (--headless takes priority over --no_viewer)
+    effective_headless = args.headless or args.no_viewer
 
     # Quick bone listing / debug mode
     if args.print_bvh_bones:
@@ -325,7 +333,7 @@ if __name__ == "__main__":
     motion_fps = 30
     
     robot_motion_viewer = None
-    if not args.no_viewer:
+    if not effective_headless:
         try:
             robot_motion_viewer = RobotMotionViewer(robot_type=args.robot,
                                                     motion_fps=motion_fps,
@@ -338,6 +346,8 @@ if __name__ == "__main__":
         except RuntimeError as e:
             print(f"[yellow]Viewer disabled due to error: {e}. Continuing headless. (Tip: run with 'mjpython' on macOS to enable viewer.)[/yellow]")
             robot_motion_viewer = None
+    elif effective_headless and args.record_video:
+        raise RuntimeError("--record_video requires viewer; cannot combine with --headless")
     # FPS measurement variables
     fps_counter = 0
     fps_start_time = time.time()
